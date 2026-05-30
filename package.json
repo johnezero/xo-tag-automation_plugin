@@ -1,0 +1,105 @@
+{
+  "name": "xo-tag-automation",
+  "version": "0.6.7",
+  "description": "Tag-based VM automation for Xen Orchestra — performance tiers, group assignment, resource set management, and CSV import/export via VM tags",
+  "author": "john olsen",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "cross-env NODE_ENV=production babel --source-maps --copy-files --out-dir=dist/ src/",
+    "dev":   "cross-env NODE_ENV=development babel --watch --source-maps --copy-files --out-dir=dist/ src/",
+    "clean": "rimraf dist/"
+  },
+  "dependencies": {
+    "@xen-orchestra/cron": "^1.0.7",
+    "@xen-orchestra/log":  "^0.7.2",
+    "csv-parse":           "^5.5.0",
+    "csv-stringify":       "^6.4.0",
+    "lodash":              "^4.17.21"
+  },
+  "devDependencies": {
+    "@babel/cli":          "^7.0.0",
+    "@babel/core":         "^7.0.0",
+    "@babel/preset-env":   "^7.0.0",
+    "cross-env":           "^7.0.2",
+    "rimraf":              "^6.0.1"
+  },
+  "xo-server-plugin": {
+    "configurationSchema": {
+      "type": "object",
+      "properties": {
+
+        "tagSuffix": {
+          "type": "string",
+          "title": "Tag Suffix",
+          "description": "Pool-specific suffix appended to performance tags (e.g. -v for POOL-V). Leave blank for generic.",
+          "default": ""
+        },
+
+        "schedule": {
+          "type": "string",
+          "title": "Enforcement Schedule",
+          "description": "How often to automatically run enabled modules.",
+          "enum": ["hourly", "daily", "disabled"],
+          "default": "daily"
+        },
+
+        "dryRun": {
+          "type": "boolean",
+          "title": "Dry Run Mode",
+          "description": "Preview all changes without applying them. Check XO logs to see output. Recommended for first run.",
+          "default": true
+        },
+
+        "enablePerformance": {
+          "type": "boolean",
+          "title": "Enable Performance Enforcement",
+          "description": "Apply CPU weights and IO priorities based on VM performance tier tags (0-core, 1-high, 2-normal, 3-low).",
+          "default": false
+        },
+
+        "enablePermissions": {
+          "type": "boolean",
+          "title": "Enable Permission Sync",
+          "description": "Watcher-only: assigns VMs to existing Groups and Resource Sets matching VM_{Dept}-Admin/Operator/Viewer tags. Never creates Groups or Resource Sets.",
+          "default": false
+        },
+
+        "enableCsvAutoExport": {
+          "type": "boolean",
+          "title": "Enable Scheduled CSV Auto-Export",
+          "description": "Automatically export VM metadata CSV on each scheduled run.",
+          "default": false
+        },
+
+        "csvPath": {
+          "type": "string",
+          "title": "CSV File Path",
+          "description": "Full path to the VM metadata CSV file. NFS-accessible path recommended.",
+          "default": "/mnt/v0/code/tag-automation/vm_metadata.csv"
+        },
+
+        "performanceTiers": {
+          "type": "object",
+          "title": "Performance Tier Settings",
+          "description": "CPU weights and IO priorities per tier. Mirrors default.conf values — override only what you need.",
+          "properties": {
+            "coreWeight":   { "type": "integer", "title": "Core CPU Weight",    "default": 2048 },
+            "coreIoPri":    { "type": "integer", "title": "Core IO Priority",   "default": 7    },
+            "highWeight":   { "type": "integer", "title": "High CPU Weight",    "default": 1024 },
+            "highIoPri":    { "type": "integer", "title": "High IO Priority",   "default": 7    },
+            "normalWeight": { "type": "integer", "title": "Normal CPU Weight",  "default": 512  },
+            "normalIoPri":  { "type": "integer", "title": "Normal IO Priority", "default": 5    },
+            "lowWeight":    { "type": "integer", "title": "Low CPU Weight",     "default": 256  },
+            "lowIoPri":     { "type": "integer", "title": "Low IO Priority",    "default": 2    }
+          }
+        }
+
+      },
+      "required": ["tagSuffix", "enablePerformance", "enablePermissions", "schedule", "csvPath"]
+    }
+  }
+}

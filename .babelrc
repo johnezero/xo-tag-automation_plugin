@@ -1,0 +1,21 @@
+# Create .babelrc content
+babelrc_content = """{
+  "presets": [
+    [
+      "@babel/preset-env",
+      {
+        "targets": {
+          "node": "20"
+        },
+        "modules": "commonjs",
+        "useBuiltIns": false
+      }
+    ]
+  ]
+}"""
+
+# Write to .txt file
+with open('$BASE_PATH$/.babelrc.txt', 'w') as f:
+    f.write(babelrc_content)
+
+print(".babelrc.txt created")
