@@ -1,40 +1,53 @@
 // ============================================================
-// xo-server-tag-automation v0.7.2
+// xo-server-tag-automation v0.7.3
 // Tag-Based VM Automation Plugin for Xen Orchestra
 //
-// Changes in v0.7.2 (Phase 2 -- Permission Autopilot):
-// - NEW: enablePermissionAutopilot (boolean, default: false)
-//        Enables CSV-sourced permission enforcement.
-//        Sources ONLY from current-vms.csv (CurrentTags column)
-//        and preload-vms.csv (Tags column). Does NOT read live
-//        VM tags -- CSV is the sole source of truth.
-// - NEW: autopilotWeeks (integer, default: 2)
-//        0 = disabled (instant off switch, no window tracking)
-//        1-4 = active for that many weeks from autopilotStartDate
-//        >4  = hard-capped to 4 with a log warning
-// - NEW: autopilotStartDate (string ISO date, default: "")
-//        Set automatically on first Autopilot run when weeks > 0.
-//        Cleared only by "Delete configuration" in XO UI.
-//        Survives plugin restarts via XO config persistence.
-// - NEW: enforcePermissionsFromCsv() -- reads CurrentTags from
-//        current-vms.csv and Tags from preload-vms.csv, finds
-//        all -Admin/-Operator/-Viewer tags, calls
-//        getOrCreateGroup() + xo.addAcl() exactly as the
-//        existing enforcePermissions() does.
-// - NEW: Autopilot runs on BOTH schedule AND Run Now (unlike
-//        existing enforcePermissions() which is OnDemand only).
-// - NEW: Autopilot self-disables when window expires -- logs
-//        a prominent WARN and skips enforcement. Does not
-//        modify enablePermissionAutopilot flag (user must
-//        manually re-enable or extend).
-// - NEW: autopilotWeeks = 0 acts as an instant pause --
-//        logs "Autopilot paused (weeks=0)" and skips without
-//        touching autopilotStartDate.
+// Changes in v0.7.3:
+// - FIX: processPreloadVms() -- replaced naive line-split CSV
+//        reader with parseFullCsv() which correctly handles
+//        RFC 4180 quoted multi-line fields. Embedded newlines
+//        in Notes fields no longer corrupt row boundaries.
+// - FIX: processPreloadVms() write-back now uses
+//        safePreloadField() which collapses embedded newlines
+//        to a single space before writing, preventing future
+//        multi-line field corruption on round-trips.
+// - FIX: processPreloadVms() rowsToKeep now stores the
+//        original raw row string for pending VMs, preventing
+//        data loss on write-back.
+// - FIX: enforcePermissionsFromCsv() preload-vms.csv source
+//        now also uses parseFullCsv() for consistency.
+// - NEW: Single NFS share path field (nfsSharePath) replaces
+//        separate csvPath and logPath fields. All filenames
+//        are locked and controlled internally:
+//          current-vms.csv
+//          preload-vms.csv
+//          logs/xo-tag-automation.log
+//          logs/xo-tag-automation-summary.log
+// - NEW: Built-in log rotation -- on each run, if the main
+//        log file exceeds LOG_MAX_BYTES (2MB), it is renamed
+//        to xo-tag-automation.log.1 and a fresh log started.
+//        One .1 backup kept. Non-fatal if rotation fails.
+// - NEW: getFilePaths() apiMethod -- returns all resolved
+//        file paths for diagnostics.
+// - CHANGED: autopilotWeeks default changed from 2 to 0.
+//        User must intentionally set a value to activate.
+// - CHANGED: autopilotWeeks maximum raised to 10 in schema
+//        (UI display). Hard safety cap in code remains 4 weeks.
+// - CHANGED: enablePermissions title/description cleaned up --
+//        removed all "OnDemand Only" wording from UI labels.
+// - CHANGED: schedule description cleaned up.
+// - CHANGED: configure() and test() log lines updated to
+//        remove "OnDemand" references.
+//
+// RETAINED from v0.7.2:
+// - Permission Autopilot (CSV-sourced, time-limited)
+// - applyPermissionTag() shared helper
+// - getAutopilotStatus() apiMethod
 //
 // RETAINED from v0.7.1:
-// - FIX: runCsvSync() guaranteed execution order
-// - FIX: writeRefreshedCsv() re-fetches post-settle
-// - FIX: sleep(500) unconditional on any live write
+// - runCsvSync() guaranteed execution order
+// - writeRefreshedCsv() re-fetches post-settle
+// - sleep(500) unconditional on any live write
 //
 // RETAINED from v0.7.0:
 // - current-vms.csv / preload-vms.csv naming
@@ -44,19 +57,28 @@
 // RETAINED from v0.6.8:
 // - Simplified permission model (-Admin/-Operator/-Viewer)
 // - getOrCreateGroup() + xo.addAcl()
-// - 500ms cache delay, NFS file logging, summary log
+// - NFS file logging, summary log
 // - Dry-Run/Export-CSV label
 // - testSchema removed (Code 10 fix)
 // - downloadCsv(), uploadCsv(), validateCsvContent() via apiMethods
 // - Notes fallback chain, tag cleanup, CSV freshness check
 // - Defensive multi-gate isRealVm() filter
-// - Permissions OnDemand only (never on cron) -- existing module
 // - NFS security warnings
 // ============================================================
 
 import { readFile, writeFile, mkdir, appendFile, rename } from "fs/promises";
-import { existsSync } from "fs";
-import { dirname, join } from "path";
+import { existsSync, statSync } from "fs";
+import { dirname, join, basename } from "path";
+
+// ============================================================
+// LOCKED FILENAMES -- controlled internally, not user-editable
+// ============================================================
+const FILE_CURRENT_VMS  = "current-vms.csv";
+const FILE_PRELOAD_VMS  = "preload-vms.csv";
+const FILE_LOG          = "xo-tag-automation.log";
+const FILE_LOG_BACKUP   = "xo-tag-automation.log.1";
+const FILE_SUMMARY_LOG  = "xo-tag-automation-summary.log";
+const LOG_MAX_BYTES     = 2 * 1024 * 1024; // 2MB rotation threshold
 
 // ============================================================
 // DEFAULTS
@@ -66,12 +88,11 @@ const DEFAULTS = {
   enablePerformance: false,
   enablePermissions: false,
   enablePermissionAutopilot: false,
-  autopilotWeeks: 2,
+  autopilotWeeks: 0,
   autopilotStartDate: "",
   schedule: "daily",
   dryRun: true,
-  csvPath: "/mnt/v0/code/tag-automation/current-vms.csv",
-  logPath: "/mnt/v0/code/tag-automation/logs/xo-tag-automation.log",
+  nfsSharePath: "/mnt/v0/code/tag-automation",
   stalenessWarnDays: 7,
   performanceTiers: {
     coreWeight: 2048,
@@ -86,16 +107,41 @@ const DEFAULTS = {
 };
 
 // ============================================================
-// NFS FILE LOGGING
-// logPath     = full rolling log (xo-tag-automation.log)
-// summaryPath = per-run summary  (xo-tag-automation-summary.log)
+// PATH HELPERS -- derive all paths from nfsSharePath
 // ============================================================
-let _logPath    = DEFAULTS.logPath;
-let _summaryPath = "";
+function getCsvPath(config)        { return join(config.nfsSharePath, FILE_CURRENT_VMS); }
+function getPreloadPath(config)    { return join(config.nfsSharePath, FILE_PRELOAD_VMS); }
+function getLogPath(config)        { return join(config.nfsSharePath, "logs", FILE_LOG); }
+function getLogBackupPath(config)  { return join(config.nfsSharePath, "logs", FILE_LOG_BACKUP); }
+function getSummaryLogPath(config) { return join(config.nfsSharePath, "logs", FILE_SUMMARY_LOG); }
+
+// ============================================================
+// NFS FILE LOGGING
+// ============================================================
+let _logPath     = getLogPath(DEFAULTS);
+let _summaryPath = getSummaryLogPath(DEFAULTS);
 let _runSummary  = [];
 
-function deriveSummaryPath(logPath) {
-  return join(dirname(logPath), "xo-tag-automation-summary.log");
+async function rotateLogIfNeeded(logPath, backupPath) {
+  try {
+    if (existsSync(logPath)) {
+      const stats = statSync(logPath);
+      if (stats.size >= LOG_MAX_BYTES) {
+        try {
+          await rename(logPath, backupPath);
+          const ts   = new Date().toISOString();
+          const line = "[" + ts + "] [INFO] xo-tag-automation: Log rotated -- previous log saved as " +
+                       basename(backupPath);
+          await mkdir(dirname(logPath), { recursive: true });
+          await appendFile(logPath, line + "\n", "utf8");
+        } catch (err) {
+          console.warn("[xo-tag-automation] Log rotation failed: " + err.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[xo-tag-automation] Could not check log size: " + err.message);
+  }
 }
 
 async function writeToFile(filePath, line) {
@@ -138,29 +184,27 @@ function endRunSummary(results) {
 }
 
 // ============================================================
-// MIGRATION HELPER -- v0.7.0
-// If vm_metadata.csv exists at the legacy path, auto-rename it
-// to current-vms.csv and log the event. Plugin continues normally.
+// MIGRATION HELPER -- v0.7.0 + v0.7.3
+// Handles legacy vm_metadata.csv rename.
 // ============================================================
-async function migrateVmMetadataCsv(csvPath) {
-  const csvDir     = dirname(csvPath);
-  const legacyPath = join(csvDir, "vm_metadata.csv");
-  const newPath    = join(csvDir, "current-vms.csv");
+async function migrateVmMetadataCsv(config) {
+  const shareDir   = config.nfsSharePath;
+  const legacyPath = join(shareDir, "vm_metadata.csv");
+  const newPath    = join(shareDir, FILE_CURRENT_VMS);
 
   if (existsSync(legacyPath) && !existsSync(newPath)) {
     try {
       await rename(legacyPath, newPath);
       logWarn(
-        "MIGRATION: vm_metadata.csv detected -- automatically renamed to current-vms.csv. " +
-        "Update your csvPath setting if it still points to vm_metadata.csv.",
+        "MIGRATION: vm_metadata.csv detected -- automatically renamed to " + FILE_CURRENT_VMS + ".",
         true
       );
     } catch (err) {
-      logWarn("MIGRATION: Could not rename vm_metadata.csv -> current-vms.csv: " + err.message);
+      logWarn("MIGRATION: Could not rename vm_metadata.csv -> " + FILE_CURRENT_VMS + ": " + err.message);
     }
   } else if (existsSync(legacyPath) && existsSync(newPath)) {
     logWarn(
-      "MIGRATION: Both vm_metadata.csv and current-vms.csv exist in " + csvDir + ". " +
+      "MIGRATION: Both vm_metadata.csv and " + FILE_CURRENT_VMS + " exist in " + shareDir + ". " +
       "Please manually verify and remove vm_metadata.csv when safe to do so."
     );
   }
@@ -177,18 +221,18 @@ function isRealVm(vm) {
   if (vm.is_control_domain) return false;
   if (!vm.name_label || !vm.name_label.trim()) return false;
   const name = vm.name_label.trim();
-  if (name.startsWith("[XO Backup"))              return false;
-  if (name.startsWith("[ESXI]"))                   return false;
-  if (name.includes("import from V2V"))            return false;
-  if (name === "complete import from V2V")         return false;
-  if (name === "after complete import from V2V")   return false;
-  if (name === "after partial import from V2V")    return false;
-  if (name === "base copy")                        return false;
-  if (name.endsWith("-flat.vmdk"))                 return false;
-  if (name.endsWith("-sesparse.vmdk"))             return false;
-  if (name.endsWith(".iso"))                       return false;
-  if (name.startsWith("Xapi#"))                    return false;
-  if (name.startsWith("Control domain on host"))   return false;
+  if (name.startsWith("[XO Backup"))            return false;
+  if (name.startsWith("[ESXI]"))                 return false;
+  if (name.includes("import from V2V"))          return false;
+  if (name === "complete import from V2V")       return false;
+  if (name === "after complete import from V2V") return false;
+  if (name === "after partial import from V2V")  return false;
+  if (name === "base copy")                      return false;
+  if (name.endsWith("-flat.vmdk"))               return false;
+  if (name.endsWith("-sesparse.vmdk"))           return false;
+  if (name.endsWith(".iso"))                     return false;
+  if (name.startsWith("Xapi#"))                  return false;
+  if (name.startsWith("Control domain on host")) return false;
   return true;
 }
 
@@ -253,6 +297,8 @@ function sleep(ms) {
 // ============================================================
 // CSV HELPERS
 // ============================================================
+
+// Standard single-line CSV field parser (used for current-vms.csv)
 function parseCsvLine(line) {
   const result = [];
   let current  = "";
@@ -272,10 +318,103 @@ function parseCsvLine(line) {
   return result;
 }
 
+// ============================================================
+// FULL RFC 4180 CSV PARSER -- v0.7.3
+// Correctly handles quoted fields containing embedded newlines,
+// commas, and escaped double-quotes (""). Used for
+// preload-vms.csv to prevent multi-line Notes fields from
+// corrupting row boundaries on read or write-back.
+//
+// Returns array of row objects: { raw, cols }
+//   raw  = original raw text of the row (for write-back of
+//          pending rows without modification)
+//   cols = array of parsed field strings (newlines preserved
+//          inside quoted fields as-is for processing)
+// ============================================================
+function parseFullCsv(content) {
+  const rows = [];
+  const len  = content.length;
+  let pos    = 0;
+
+  while (pos < len) {
+    const rowStart = pos;
+    const cols     = [];
+    let field      = "";
+    let inQuotes   = false;
+
+    while (pos < len) {
+      const ch = content[pos];
+
+      if (inQuotes) {
+        if (ch === '"') {
+          // Peek ahead for escaped quote ("")
+          if (pos + 1 < len && content[pos + 1] === '"') {
+            field += '"';
+            pos += 2;
+          } else {
+            // Closing quote
+            inQuotes = false;
+            pos++;
+          }
+        } else {
+          field += ch;
+          pos++;
+        }
+      } else {
+        if (ch === '"') {
+          inQuotes = true;
+          pos++;
+        } else if (ch === ",") {
+          cols.push(field.trim());
+          field = "";
+          pos++;
+        } else if (ch === "\r" && pos + 1 < len && content[pos + 1] === "\n") {
+          // CRLF -- end of row
+          pos += 2;
+          break;
+        } else if (ch === "\n") {
+          // LF -- end of row
+          pos++;
+          break;
+        } else {
+          field += ch;
+          pos++;
+        }
+      }
+    }
+
+    // Push last field of row
+    cols.push(field.trim());
+
+    // Build raw text of this row (for write-back)
+    const raw = content.slice(rowStart, pos).replace(/\r?\n$/, "");
+
+    // Skip completely empty rows
+    if (cols.length === 1 && cols[0] === "") continue;
+
+    rows.push({ raw, cols });
+  }
+
+  return rows;
+}
+
+// Standard field quoter for current-vms.csv
 function quoteCsvField(val) {
   if (!val) return "";
   const s = String(val);
   if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+// Safe field writer for preload-vms.csv write-back -- v0.7.3
+// Collapses embedded newlines to a single space so the file
+// stays single-line-per-row after processing.
+function safePreloadField(val) {
+  if (!val) return "";
+  const s = String(val).replace(/\r?\n/g, " ").trim();
+  if (s.includes(",") || s.includes('"')) {
     return '"' + s.replace(/"/g, '""') + '"';
   }
   return s;
@@ -331,7 +470,7 @@ function validateCsvContent(content) {
 // ============================================================
 function checkCsvFreshness(metaLine, liveVmCount, stalenessWarnDays) {
   if (!metaLine || !metaLine.startsWith("#")) {
-    logWarn("current-vms.csv has no metadata header -- consider running Export CSV to refresh.");
+    logWarn(FILE_CURRENT_VMS + " has no metadata header -- consider running Export CSV to refresh.");
     return;
   }
   const meta = parseMetaHeader(metaLine);
@@ -339,7 +478,7 @@ function checkCsvFreshness(metaLine, liveVmCount, stalenessWarnDays) {
     const ageDays = Math.floor((new Date() - new Date(meta.date)) / (1000 * 60 * 60 * 24));
     if (ageDays > stalenessWarnDays) {
       logWarn(
-        "current-vms.csv may be stale -- last updated " + ageDays + " days ago (" + meta.date + ").",
+        FILE_CURRENT_VMS + " may be stale -- last updated " + ageDays + " days ago (" + meta.date + ").",
         true
       );
     } else {
@@ -348,7 +487,7 @@ function checkCsvFreshness(metaLine, liveVmCount, stalenessWarnDays) {
   }
   if (meta.vmCount !== null && liveVmCount > meta.vmCount) {
     logWarn(
-      "current-vms.csv may be missing VMs -- CSV has " + meta.vmCount + " VMs, " +
+      FILE_CURRENT_VMS + " may be missing VMs -- CSV has " + meta.vmCount + " VMs, " +
       "live pool has " + liveVmCount + " (" + (liveVmCount - meta.vmCount) + " new VM(s) detected).",
       true
     );
@@ -448,7 +587,6 @@ async function getOrCreateGroup(xo, groupName, dryRun) {
 
 // ============================================================
 // SHARED HELPER -- apply a single permission tag to a VM
-// Used by both enforcePermissions() and enforcePermissionsFromCsv()
 // ============================================================
 async function applyPermissionTag(xo, tag, vm, dryRun, counters) {
   const role    = getRoleFromTag(tag);
@@ -491,14 +629,12 @@ async function applyPermissionTag(xo, tag, vm, dryRun, counters) {
 }
 
 // ============================================================
-// PERMISSIONS MODULE -- OnDemand ONLY (existing, tag-driven)
-// Any live VM tag ending in -Admin / -Operator / -Viewer triggers:
-//   1. getOrCreateGroup(tag)
-//   2. xo.addAcl(groupId, vmId, role)
+// PERMISSIONS MODULE -- tag-driven, Run Now only
+// (never runs on schedule -- by design)
 // ============================================================
 async function enforcePermissions(xo, config) {
   const dryRun = config.dryRun;
-  logWarn("=== SECURITY NOTICE: Permission Sync is running OnDemand ===", true);
+  logWarn("=== SECURITY NOTICE: Permission Sync is running ===", true);
   logWarn("=== Ensure your NFS share is secured before proceeding ===");
   logInfo("=== Permission Sync starting (dryRun=" + dryRun + ") ===", true);
   const allVms = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
@@ -527,46 +663,32 @@ async function enforcePermissions(xo, config) {
 
 // ============================================================
 // PERMISSION AUTOPILOT MODULE -- v0.7.2
-//
-// CSV-sourced permission enforcement. Reads permission tags
-// from current-vms.csv (CurrentTags column) and preload-vms.csv
-// (Tags column). Does NOT read live VM tags.
-//
-// Window logic:
-//   autopilotWeeks = 0  -> paused, skip silently with log
-//   autopilotWeeks > 4  -> clamped to 4 with WARN
-//   autopilotStartDate empty + weeks > 0 -> set to today, save
-//   elapsed > weeks * 7 days -> expired, log WARN, skip
-//   otherwise -> run enforcePermissionsFromCsv()
-//
-// Returns updated config (with autopilotStartDate set if new).
+// autopilotWeeks = 0   -> paused
+// autopilotWeeks 1-4   -> active window
+// autopilotWeeks 5-10  -> clamped to 4 (schema max=10 for UI,
+//                         code enforces 4 as hard safety cap)
 // ============================================================
 async function runPermissionAutopilot(xo, config) {
-  const dryRun = config.dryRun;
-
-  // Guard: feature disabled
   if (!config.enablePermissionAutopilot) {
     logInfo("Permission Autopilot disabled -- skipping.");
     return config;
   }
 
-  // Guard: weeks = 0 means paused
   let weeks = parseInt(config.autopilotWeeks, 10);
   if (isNaN(weeks) || weeks === 0) {
     logInfo("Permission Autopilot paused (autopilotWeeks=0) -- skipping.");
     return config;
   }
 
-  // Hard cap at 4 weeks
   if (weeks > 4) {
     logWarn(
-      "Permission Autopilot: autopilotWeeks=" + weeks + " exceeds maximum of 4 -- clamping to 4.",
+      "Permission Autopilot: autopilotWeeks=" + weeks +
+      " exceeds safety cap of 4 -- clamping to 4 weeks.",
       true
     );
     weeks = 4;
   }
 
-  // Set start date on first run
   let updatedConfig = config;
   let startDate     = config.autopilotStartDate ? new Date(config.autopilotStartDate) : null;
 
@@ -581,11 +703,10 @@ async function runPermissionAutopilot(xo, config) {
     startDate     = new Date(today);
   }
 
-  // Check window expiry
-  const nowMs      = Date.now();
-  const startMs    = startDate.getTime();
-  const windowMs   = weeks * 7 * 24 * 60 * 60 * 1000;
-  const elapsedMs  = nowMs - startMs;
+  const nowMs       = Date.now();
+  const startMs     = startDate.getTime();
+  const windowMs    = weeks * 7 * 24 * 60 * 60 * 1000;
+  const elapsedMs   = nowMs - startMs;
   const elapsedDays = Math.floor(elapsedMs / (1000 * 60 * 60 * 24));
   const windowDays  = weeks * 7;
 
@@ -611,20 +732,19 @@ async function runPermissionAutopilot(xo, config) {
 }
 
 // ============================================================
-// ENFORCE PERMISSIONS FROM CSV -- v0.7.2
-// Reads permission tags from:
-//   1. current-vms.csv  -- CurrentTags column, matched by UUID
-//   2. preload-vms.csv  -- Tags column, matched by VM name
-// Does NOT read live VM tags. CSV is the sole source of truth.
+// ENFORCE PERMISSIONS FROM CSV -- v0.7.2 + v0.7.3 fix
+// Source 1: current-vms.csv  (CurrentTags col, matched by UUID)
+// Source 2: preload-vms.csv  (Tags col, matched by VM name)
+//           Now uses parseFullCsv() for safe multi-line handling.
+// Does NOT read live VM tags.
 // ============================================================
 async function enforcePermissionsFromCsv(xo, config) {
-  const dryRun  = config.dryRun;
-  const csvPath = config.csvPath;
-  const csvDir  = dirname(csvPath);
+  const dryRun      = config.dryRun;
+  const csvPath     = getCsvPath(config);
+  const preloadPath = getPreloadPath(config);
 
   logInfo("=== Permission Autopilot: enforcePermissionsFromCsv starting (dryRun=" + dryRun + ") ===", true);
 
-  // Build live VM lookup maps
   const allVms   = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
   const vmByUuid = {};
   const vmByName = {};
@@ -635,30 +755,27 @@ async function enforcePermissionsFromCsv(xo, config) {
 
   const counters = { processed: 0, created: 0, aclsApplied: 0, skipped: 0 };
 
-  // --- Source 1: current-vms.csv (CurrentTags column, col index 2) ---
+  // --- Source 1: current-vms.csv (standard single-line rows) ---
   if (existsSync(csvPath)) {
     let raw;
     try { raw = await readFile(csvPath, "utf8"); } catch (err) {
-      logWarn("Autopilot: Could not read current-vms.csv: " + err.message);
+      logWarn("Autopilot: Could not read " + FILE_CURRENT_VMS + ": " + err.message);
       raw = null;
     }
     if (raw) {
-      const lines     = raw.split("\n").filter(function(l) { return l.trim(); });
-      let dataStart   = 0;
+      const lines   = raw.split("\n").filter(function(l) { return l.trim(); });
+      let dataStart = 0;
       if (lines[0] && lines[0].startsWith("#")) dataStart = 1;
       dataStart++; // skip column header
       for (let i = dataStart; i < lines.length; i++) {
-        const cols = parseCsvLine(lines[i]);
+        const cols     = parseCsvLine(lines[i]);
         if (!cols[0] || cols[0].startsWith("#")) continue;
-        const uuid      = (cols[0] || "").trim();
-        const tagsStr   = (cols[2] || "").trim(); // CurrentTags
-        const permTags  = parseTags(tagsStr).filter(isPermissionTag);
+        const uuid     = (cols[0] || "").trim();
+        const tagsStr  = (cols[2] || "").trim(); // CurrentTags
+        const permTags = parseTags(tagsStr).filter(isPermissionTag);
         if (permTags.length === 0) continue;
         const vm = vmByUuid[uuid];
-        if (!vm) {
-          logInfo("  Autopilot: UUID " + uuid + " not found in live pool -- skipping.");
-          continue;
-        }
+        if (!vm) { logInfo("  Autopilot: UUID " + uuid + " not found in live pool -- skipping."); continue; }
         counters.processed++;
         logInfo("  Autopilot [CSV] VM \"" + vm.name_label + "\" -- perm tags: " + permTags.join(", "));
         for (let j = 0; j < permTags.length; j++) {
@@ -667,31 +784,27 @@ async function enforcePermissionsFromCsv(xo, config) {
       }
     }
   } else {
-    logWarn("Autopilot: current-vms.csv not found at " + csvPath + " -- skipping source 1.");
+    logWarn("Autopilot: " + FILE_CURRENT_VMS + " not found at " + csvPath + " -- skipping source 1.");
   }
 
-  // --- Source 2: preload-vms.csv (Tags column, col index 1) ---
-  const preloadPath = join(csvDir, "preload-vms.csv");
+  // --- Source 2: preload-vms.csv (use full RFC 4180 parser) ---
   if (existsSync(preloadPath)) {
     let raw;
     try { raw = await readFile(preloadPath, "utf8"); } catch (err) {
-      logWarn("Autopilot: Could not read preload-vms.csv: " + err.message);
+      logWarn("Autopilot: Could not read " + FILE_PRELOAD_VMS + ": " + err.message);
       raw = null;
     }
     if (raw) {
-      const lines     = raw.split("\n");
-      const dataLines = lines.slice(1).filter(function(l) { return l.trim(); });
-      for (let i = 0; i < dataLines.length; i++) {
-        const cols     = parseCsvLine(dataLines[i]);
+      const allRows  = parseFullCsv(raw);
+      const dataRows = allRows.slice(1); // skip header row
+      for (let i = 0; i < dataRows.length; i++) {
+        const cols     = dataRows[i].cols;
         const name     = (cols[0] || "").trim();
         const tagsStr  = (cols[1] || "").trim();
         const permTags = parseTags(tagsStr).filter(isPermissionTag);
         if (!name || permTags.length === 0) continue;
         const vm = vmByName[name];
-        if (!vm) {
-          logInfo("  Autopilot [Preload] VM \"" + name + "\" not yet in pool -- skipping.");
-          continue;
-        }
+        if (!vm) { logInfo("  Autopilot [Preload] VM \"" + name + "\" not yet in pool -- skipping."); continue; }
         counters.processed++;
         logInfo("  Autopilot [Preload] VM \"" + vm.name_label + "\" -- perm tags: " + permTags.join(", "));
         for (let j = 0; j < permTags.length; j++) {
@@ -700,7 +813,7 @@ async function enforcePermissionsFromCsv(xo, config) {
       }
     }
   } else {
-    logInfo("Autopilot: preload-vms.csv not found at " + preloadPath + " -- skipping source 2.");
+    logInfo("Autopilot: " + FILE_PRELOAD_VMS + " not found -- skipping source 2.");
   }
 
   const summary =
@@ -721,10 +834,7 @@ async function cleanupTags(xo, config, csvRows) {
   for (let i = 0; i < csvRows.length; i++) {
     const row = csvRows[i];
     if (!row.uuid) continue;
-    csvMap[row.uuid] = {
-      csvTags: parseTags(row.currentTags),
-      newTags: parseTags(row.newTags),
-    };
+    csvMap[row.uuid] = { csvTags: parseTags(row.currentTags), newTags: parseTags(row.newTags) };
   }
   const allVms = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
   let removed  = 0;
@@ -818,16 +928,16 @@ async function syncNotesToVm(xo, vm, newNotes, dryRun) {
 // WRITE SINGLE VM ROW -- v0.7.0
 // ============================================================
 async function refreshSingleVmInCsv(xo, config, vm) {
-  const csvPath = config.csvPath;
+  const csvPath = getCsvPath(config);
   if (!existsSync(csvPath)) {
-    logWarn("  Preload: current-vms.csv not found -- skipping row refresh for \"" + vm.name_label + "\".");
+    logWarn("  Preload: " + FILE_CURRENT_VMS + " not found -- skipping row refresh for \"" + vm.name_label + "\".");
     return;
   }
   let raw;
   try {
     raw = await readFile(csvPath, "utf8");
   } catch (err) {
-    logWarn("  Preload: Could not read current-vms.csv for row refresh: " + err.message);
+    logWarn("  Preload: Could not read " + FILE_CURRENT_VMS + " for row refresh: " + err.message);
     return;
   }
   await sleep(500);
@@ -846,97 +956,146 @@ async function refreshSingleVmInCsv(xo, config, vm) {
   });
   if (!matched) {
     updatedLines.push(newRow);
-    logInfo("  Preload: VM \"" + vm.name_label + "\" not in current-vms.csv -- appended new row.");
+    logInfo("  Preload: VM \"" + vm.name_label + "\" not in " + FILE_CURRENT_VMS + " -- appended new row.");
   } else {
-    logInfo("  Preload: current-vms.csv row refreshed for VM \"" + vm.name_label + "\".");
+    logInfo("  Preload: " + FILE_CURRENT_VMS + " row refreshed for VM \"" + vm.name_label + "\".");
   }
   try {
     await writeFile(csvPath, updatedLines.join("\n"), "utf8");
   } catch (err) {
-    logWarn("  Preload: Could not write updated current-vms.csv: " + err.message);
+    logWarn("  Preload: Could not write updated " + FILE_CURRENT_VMS + ": " + err.message);
   }
 }
 
 // ============================================================
-// PRELOAD-VMS PRE-LOADER -- v0.7.0
+// PRELOAD-VMS PRE-LOADER -- v0.7.3 FIXED
+//
+// Key fixes vs v0.7.2:
+//   1. Uses parseFullCsv() instead of raw.split("\n") so that
+//      quoted multi-line Notes fields are handled correctly
+//      and never corrupt row boundaries.
+//   2. rowsToKeep stores the original raw row string for
+//      pending VMs, preserving them exactly as-is on write-back.
+//   3. Notes field is sanitized on read (newlines -> space)
+//      before being passed to syncNotesToVm().
 // ============================================================
 async function processPreloadVms(xo, config, mainCsvRows) {
   const dryRun      = config.dryRun;
-  const csvDir      = dirname(config.csvPath);
-  const preloadPath = join(csvDir, "preload-vms.csv");
+  const preloadPath = getPreloadPath(config);
 
   if (!existsSync(preloadPath)) {
-    logInfo("preload-vms.csv not found at " + preloadPath + " -- skipping pre-loader.");
+    logInfo(FILE_PRELOAD_VMS + " not found at " + preloadPath + " -- skipping pre-loader.");
     return;
   }
+
   logInfo("=== Preload-VMs Pre-loader starting (dryRun=" + dryRun + ") ===");
+
   let raw;
   try {
     raw = await readFile(preloadPath, "utf8");
   } catch (err) {
-    logWarn("Could not read preload-vms.csv: " + err.message);
+    logWarn("Could not read " + FILE_PRELOAD_VMS + ": " + err.message);
     return;
   }
-  const lines = raw.split("\n");
-  if (lines.length < 2) { logInfo("preload-vms.csv is empty -- skipping."); return; }
-  const header    = lines[0];
-  const dataLines = lines.slice(1).filter(function(l) { return l.trim(); });
-  const allVms    = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
-  const vmByName  = {};
+
+  // Use full RFC 4180 parser -- handles quoted multi-line fields correctly
+  const allRows = parseFullCsv(raw);
+  if (allRows.length < 2) {
+    logInfo(FILE_PRELOAD_VMS + " is empty or header-only -- skipping.");
+    return;
+  }
+
+  // Header row -- preserve exactly for write-back
+  const headerText = allRows[0].raw;
+  const dataRows   = allRows.slice(1);
+
+  // Build lookup maps
+  const allVms   = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
+  const vmByName = {};
   for (let i = 0; i < allVms.length; i++) { vmByName[allVms[i].name_label] = allVms[i]; }
+
   const mainCsvByUuid = {};
   for (let i = 0; i < mainCsvRows.length; i++) {
     if (mainCsvRows[i].uuid) mainCsvByUuid[mainCsvRows[i].uuid] = mainCsvRows[i];
   }
+
+  // rowsToKeep stores original raw strings for write-back of pending rows
   const rowsToKeep = [];
   let processed = 0, alreadyDone = 0, duplicates = 0, pending = 0;
-  for (let i = 0; i < dataLines.length; i++) {
-    const cols     = parseCsvLine(dataLines[i]);
-    const name     = (cols[0] || "").trim();
-    const tags     = (cols[1] || "").trim();
-    const newNotes = (cols[2] || "").trim();
+
+  for (let i = 0; i < dataRows.length; i++) {
+    const cols    = dataRows[i].cols;
+    const rawRow  = dataRows[i].raw;
+
+    const name = (cols[0] || "").trim();
+    const tags = (cols[1] || "").trim();
+    // Sanitize notes: collapse embedded newlines to a single space
+    const newNotes = (cols[2] || "").replace(/\r?\n/g, " ").trim();
+
     if (!name) continue;
+
     const vm = vmByName[name];
+
+    // VM not yet in pool -- keep original raw row exactly, retry next run
     if (!vm) {
       logInfo("  Preload: VM \"" + name + "\" not yet in pool -- will retry next run.");
-      rowsToKeep.push(dataLines[i]);
+      rowsToKeep.push(rawRow);
       pending++;
       continue;
     }
+
+    // VM already tagged in current-vms.csv -- treat as duplicate, drop row
     const mainEntry = mainCsvByUuid[vm.uuid];
     if (mainEntry && parseTags(mainEntry.currentTags).length > 0) {
-      logWarn("  Preload: VM \"" + name + "\" already in current-vms.csv with tags -- removing from preload-vms.csv.");
+      logWarn(
+        "  Preload: VM \"" + name + "\" already in " + FILE_CURRENT_VMS +
+        " with tags -- removing from " + FILE_PRELOAD_VMS + "."
+      );
       duplicates++;
       continue;
     }
+
+    // VM found and not yet tagged -- apply tags + notes
     const tagsToAdd = parseTags(tags);
     logInfo("  Preload: Processing VM \"" + name + "\" -- tags: " + tagsToAdd.join(", "));
+
     const result = await applyTagsToVm(xo, vm, tagsToAdd, dryRun);
+
     if (result.applied.length === 0 && result.skipped.length > 0) {
       logInfo("  Preload: VM \"" + name + "\" already had all tags -- marking as done.");
       alreadyDone++;
     } else {
       processed++;
     }
-    if (newNotes) { await syncNotesToVm(xo, vm, newNotes, dryRun); }
+
+    if (newNotes) {
+      await syncNotesToVm(xo, vm, newNotes, dryRun);
+    }
+
+    // Immediately refresh this VM's row in current-vms.csv
     if (!dryRun) {
       await refreshSingleVmInCsv(xo, config, vm);
     } else {
-      logInfo("[DRY-RUN] Would: refresh current-vms.csv row for VM \"" + name + "\"");
+      logInfo("[DRY-RUN] Would: refresh " + FILE_CURRENT_VMS + " row for VM \"" + name + "\"");
     }
+    // Row successfully processed -- do NOT add to rowsToKeep
   }
-  const newContent =
-    [header].concat(rowsToKeep).join("\n") + (rowsToKeep.length > 0 ? "\n" : "");
+
+  // Write back: header + pending rows only (pending rows use original raw text)
+  const newLines   = [headerText].concat(rowsToKeep);
+  const newContent = newLines.join("\n") + (rowsToKeep.length > 0 ? "\n" : "");
+
   if (!dryRun) {
     try {
       await writeFile(preloadPath, newContent, "utf8");
-      logInfo("  Preload: preload-vms.csv updated -- " + rowsToKeep.length + " row(s) remaining.");
+      logInfo("  Preload: " + FILE_PRELOAD_VMS + " updated -- " + rowsToKeep.length + " row(s) remaining.");
     } catch (err) {
-      logWarn("  Preload: Could not write preload-vms.csv: " + err.message);
+      logWarn("  Preload: Could not write " + FILE_PRELOAD_VMS + ": " + err.message);
     }
   } else {
-    logInfo("[DRY-RUN] Would write " + rowsToKeep.length + " pending row(s) back to preload-vms.csv");
+    logInfo("[DRY-RUN] Would write " + rowsToKeep.length + " pending row(s) back to " + FILE_PRELOAD_VMS);
   }
+
   logInfo(
     "=== Preload-VMs Pre-loader complete -- " +
     processed + " processed, " + alreadyDone + " already done, " +
@@ -949,25 +1108,25 @@ async function processPreloadVms(xo, config, mainCsvRows) {
 // ============================================================
 async function runCsvSync(xo, config) {
   const dryRun          = config.dryRun;
-  const csvPath         = config.csvPath;
+  const csvPath         = getCsvPath(config);
   const stalenessWarnDays = config.stalenessWarnDays;
 
   logInfo("=== CSV Sync starting (dryRun=" + dryRun + ", path=" + csvPath + ") ===", true);
 
   if (!existsSync(csvPath)) {
-    logWarn("current-vms.csv not found at " + csvPath + " -- run Export CSV first.", true);
+    logWarn(FILE_CURRENT_VMS + " not found at " + csvPath + " -- run Export CSV first.", true);
     return { error: "CSV not found" };
   }
   let raw;
   try {
     raw = await readFile(csvPath, "utf8");
   } catch (err) {
-    logWarn("Could not read current-vms.csv: " + err.message);
+    logWarn("Could not read " + FILE_CURRENT_VMS + ": " + err.message);
     return { error: err.message };
   }
   const lines = raw.split("\n").filter(function(l) { return l.trim(); });
   if (lines.length < 2) {
-    logWarn("current-vms.csv appears empty -- run Export CSV first.");
+    logWarn(FILE_CURRENT_VMS + " appears empty -- run Export CSV first.");
     return { error: "CSV empty" };
   }
   let metaLine  = null;
@@ -1031,7 +1190,7 @@ async function runCsvSync(xo, config) {
     await writeRefreshedCsv(xo, config, allVms);
   } else {
     logInfo(
-      "[DRY-RUN] Would rewrite current-vms.csv with refreshed CurrentTags, " +
+      "[DRY-RUN] Would rewrite " + FILE_CURRENT_VMS + " with refreshed CurrentTags, " +
       "cleared NewTags, updated CurrentNotes, cleared NewNotes."
     );
   }
@@ -1046,7 +1205,7 @@ async function runCsvSync(xo, config) {
 // WRITE REFRESHED CSV -- v0.7.1
 // ============================================================
 async function writeRefreshedCsv(xo, config, allVms) {
-  const csvPath    = config.csvPath;
+  const csvPath    = getCsvPath(config);
   const tagSuffix  = config.tagSuffix;
   const metaHeader = buildMetaHeader(allVms.length, tagSuffix);
   const colHeader  = "UUID,Name,CurrentTags,NewTags,CurrentNotes,NewNotes";
@@ -1063,9 +1222,9 @@ async function writeRefreshedCsv(xo, config, allVms) {
   try {
     await mkdir(dirname(csvPath), { recursive: true });
     await writeFile(csvPath, output, "utf8");
-    logInfo("current-vms.csv refreshed -- " + allVms.length + " VMs written to " + csvPath);
+    logInfo(FILE_CURRENT_VMS + " refreshed -- " + allVms.length + " VMs written to " + csvPath);
   } catch (err) {
-    logWarn("Could not write refreshed current-vms.csv: " + err.message);
+    logWarn("Could not write refreshed " + FILE_CURRENT_VMS + ": " + err.message);
   }
 }
 
@@ -1074,7 +1233,7 @@ async function writeRefreshedCsv(xo, config, allVms) {
 // ============================================================
 async function exportCsv(xo, config) {
   const dryRun    = config.dryRun;
-  const csvPath   = config.csvPath;
+  const csvPath   = getCsvPath(config);
   const tagSuffix = config.tagSuffix;
   logInfo("=== Export CSV starting (dryRun=" + dryRun + ", path=" + csvPath + ") ===", true);
   const allVms = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
@@ -1109,10 +1268,10 @@ async function exportCsv(xo, config) {
 // DOWNLOAD CSV (apiMethods only)
 // ============================================================
 async function downloadCsv(config) {
-  const csvPath = config.csvPath;
+  const csvPath = getCsvPath(config);
   logInfo("=== Download CSV starting (path=" + csvPath + ") ===");
   if (!existsSync(csvPath)) {
-    throw new Error("CSV file not found at: \"" + csvPath + "\". Run Export CSV first.");
+    throw new Error(FILE_CURRENT_VMS + " not found at: \"" + csvPath + "\". Run Export CSV first.");
   }
   try {
     const content  = await readFile(csvPath, "utf8");
@@ -1132,7 +1291,7 @@ async function downloadCsv(config) {
 // UPLOAD CSV (apiMethods only)
 // ============================================================
 async function uploadCsv(config, rawContent) {
-  const csvPath = config.csvPath;
+  const csvPath = getCsvPath(config);
   logInfo("=== Upload CSV starting (path=" + csvPath + ") ===");
   if (!rawContent || !rawContent.trim()) {
     throw new Error("CSV content is empty -- nothing to upload.");
@@ -1163,29 +1322,28 @@ function getCron(schedule) {
 }
 
 // ============================================================
-// CONFIGURATION SCHEMA -- v0.7.2
+// CONFIGURATION SCHEMA -- v0.7.3
 // ============================================================
 export const configurationSchema = {
   type: "object",
   description:
-    "IMPORTANT -- About the 'Delete configuration' button at the bottom of this dialog: " +
-    "Despite its name, this button ONLY clears the plugin settings back to defaults. " +
-    "It does NOT delete any VMs, tags, groups, resource sets, or CSV files on your NFS share. " +
-    "It is safe to use if you simply want to reset the plugin configuration fields. " +
-    "NOTE: Clicking it will also clear the autopilotStartDate, resetting the Autopilot window.",
+    "IMPORTANT -- The 'Delete configuration' button resets all plugin settings to their defaults. " +
+    "It does not delete any VMs, tags, groups, resource sets, or CSV files on your NFS share. " +
+    "It is safe to use if you want to reset the plugin configuration. " +
+    "It also clears the autopilotStartDate, which resets the Autopilot window.",
   properties: {
     tagSuffix: {
       type: "string",
       title: "Tag Suffix",
-      description: "Pool-specific suffix on performance tags (e.g. -v for this pool).",
+      description:
+        "Pool-specific suffix of performance tags, for granular control by pool " +
+        "(e.g. '-v' for POOL-V, '-1' for POOL-1).",
       default: "-v",
     },
     schedule: {
       type: "string",
       title: "Enforcement Schedule",
-      description:
-        "How often to run Performance, CSV Sync, and Permission Autopilot. " +
-        "NOTE: Standard Permission Sync (tag-driven) NEVER runs on schedule -- OnDemand only.",
+      description: "How often to run Performance, CSV Sync, and Permission Autopilot.",
       enum: ["hourly", "daily", "disabled"],
       default: "daily",
     },
@@ -1200,18 +1358,18 @@ export const configurationSchema = {
     },
     enablePerformance: {
       type: "boolean",
-      title: "Enable Performance Sync",
+      title: "Enable Performance Enforcement",
       description:
-        "Apply CPU weights and IO priorities based on 0-core / 1-high / 2-normal / 3-low tags.",
+        "Apply CPU weights and IO priorities based on VM performance tier tags " +
+        "(0-core, 1-high, 2-normal, 3-low).",
       default: false,
     },
     enablePermissions: {
       type: "boolean",
-      title: "Enable Permission Sync (OnDemand Only)",
+      title: "Enable Permission Sync",
       description:
-        "SECURITY: Standard Permission Sync NEVER runs automatically. OnDemand via Run Now only. " +
-        "Tags ending in -Admin / -Operator / -Viewer trigger group creation and ACL grants. " +
-        "Secure your NFS share before enabling.",
+        "Tags ending in -Admin / -Operator / -Viewer trigger group creation and ACL assignments. " +
+        "IMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
       default: false,
     },
     enablePermissionAutopilot: {
@@ -1219,11 +1377,10 @@ export const configurationSchema = {
       title: "Enable Permission Autopilot",
       description:
         "CSV-sourced permission enforcement. Reads -Admin/-Operator/-Viewer tags from " +
-        "current-vms.csv (CurrentTags column) and preload-vms.csv (Tags column) only -- " +
-        "does NOT read live VM tags. Runs on schedule AND Run Now. " +
-        "Active for the number of weeks set in 'Autopilot Window (weeks)'. " +
-        "Set weeks to 0 to pause without disabling. " +
-        "SECURITY: Secure your NFS share before enabling.",
+        FILE_CURRENT_VMS + " (CurrentTags column) and " + FILE_PRELOAD_VMS + " (Tags column) only -- " +
+        "does NOT read live VM tags. Runs on set schedule AND via Run Now. " +
+        "Set Autopilot Window to 0 to pause, or 1-4 to activate for that many weeks. " +
+        "IMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
       default: false,
     },
     autopilotWeeks: {
@@ -1232,11 +1389,11 @@ export const configurationSchema = {
       description:
         "Number of weeks the Permission Autopilot will run from its start date. " +
         "0 = paused (instant off switch, window timer is preserved). " +
-        "1-4 = active window. Maximum is 4 weeks (safety cap). " +
-        "Values above 4 are automatically clamped to 4.",
-      default: 2,
+        "1-4 = active window (safety cap -- values above 4 are clamped to 4). " +
+        "Default is 0 -- you must intentionally set a value to activate.",
+      default: 0,
       minimum: 0,
-      maximum: 4,
+      maximum: 10,
     },
     autopilotStartDate: {
       type: "string",
@@ -1248,27 +1405,20 @@ export const configurationSchema = {
         "Cleared automatically if you click 'Delete configuration'.",
       default: "",
     },
-    csvPath: {
+    nfsSharePath: {
       type: "string",
-      title: "CSV File Path (current-vms.csv)",
+      title: "NFS Share Path",
       description:
-        "Full path to current-vms.csv on your NFS share. " +
-        "If vm_metadata.csv is detected in the same directory on load, it will be automatically renamed. " +
-        "preload-vms.csv is auto-detected in the same directory.",
-      default: "/mnt/v0/code/tag-automation/current-vms.csv",
-    },
-    logPath: {
-      type: "string",
-      title: "Log File Path",
-      description:
-        "Full path to plugin log file on your NFS share. " +
-        "A companion summary log is written to the same directory as xo-tag-automation-summary.log.",
-      default: "/mnt/v0/code/tag-automation/logs/xo-tag-automation.log",
+        "Base path to your NFS share directory. All plugin files are managed here automatically: " +
+        FILE_CURRENT_VMS + ", " + FILE_PRELOAD_VMS + ", logs/" + FILE_LOG + ", " +
+        "logs/" + FILE_SUMMARY_LOG + ". " +
+        "Log files are automatically rotated at 2MB (one backup kept as " + FILE_LOG_BACKUP + ").",
+      default: "/mnt/v0/code/tag-automation",
     },
     stalenessWarnDays: {
       type: "integer",
       title: "CSV Age Warning (days)",
-      description: "Warn in logs if current-vms.csv has not been exported in this many days.",
+      description: "Warn in logs if " + FILE_CURRENT_VMS + " has not been exported in this many days.",
       default: 7,
     },
     performanceTiers: {
@@ -1287,7 +1437,7 @@ export const configurationSchema = {
       },
     },
   },
-  required: ["tagSuffix", "enablePerformance", "enablePermissions", "schedule"],
+  required: ["tagSuffix", "enablePerformance", "enablePermissions", "schedule", "nfsSharePath"],
 };
 
 // ============================================================
@@ -1300,8 +1450,8 @@ export const configurationSchema = {
 export default function({ xo }) {
   let _config  = Object.assign({}, DEFAULTS);
   let _job     = null;
-  _logPath     = DEFAULTS.logPath;
-  _summaryPath = deriveSummaryPath(DEFAULTS.logPath);
+  _logPath     = getLogPath(DEFAULTS);
+  _summaryPath = getSummaryLogPath(DEFAULTS);
 
   logInfo("Plugin factory called -- xo context: " + (xo ? "YES" : "NO"));
   logWarn("SECURITY REMINDER: Ensure NFS share is secured before enabling Permissions or Autopilot.");
@@ -1321,17 +1471,16 @@ export default function({ xo }) {
       fn: async function() {
         logInfo("=== Scheduled run triggered ===", true);
         startRunSummary();
+        await rotateLogIfNeeded(_logPath, getLogBackupPath(_config));
         if (_config.enablePerformance) await enforcePerformance(xo, _config);
         await runCsvSync(xo, _config);
-        // Autopilot runs on schedule (unlike standard Permission Sync)
         if (_config.enablePermissionAutopilot) {
           const updatedConfig = await runPermissionAutopilot(xo, _config);
-          // Persist autopilotStartDate if it was newly set
           if (updatedConfig.autopilotStartDate !== _config.autopilotStartDate) {
             _config = updatedConfig;
           }
         }
-        // NOTE: Standard enforcePermissions() intentionally excluded from scheduled runs
+        // NOTE: enforcePermissions() intentionally excluded from scheduled runs
         endRunSummary(["scheduled"]);
       },
     });
@@ -1347,23 +1496,24 @@ export default function({ xo }) {
           (rawConfig && rawConfig.performanceTiers) || {}
         ),
       });
-      _logPath     = _config.logPath || DEFAULTS.logPath;
-      _summaryPath = deriveSummaryPath(_logPath);
+      _logPath     = getLogPath(_config);
+      _summaryPath = getSummaryLogPath(_config);
       logInfo(
         "Configured -- suffix=" + _config.tagSuffix +
         " schedule=" + _config.schedule +
         " dryRun=" + _config.dryRun +
         " perf=" + _config.enablePerformance +
-        " perms=" + _config.enablePermissions + " (OnDemand only)" +
+        " perms=" + _config.enablePermissions +
         " autopilot=" + _config.enablePermissionAutopilot +
         " autopilotWeeks=" + _config.autopilotWeeks +
-        " autopilotStartDate=" + (_config.autopilotStartDate || "not set")
+        " autopilotStartDate=" + (_config.autopilotStartDate || "not set") +
+        " nfsSharePath=" + _config.nfsSharePath
       );
     },
 
     load: async function() {
       logInfo("Plugin loading...");
-      await migrateVmMetadataCsv(_config.csvPath);
+      await migrateVmMetadataCsv(_config);
       if (xo.hooks) {
         xo.hooks.on("core started", function() {
           logInfo("Core started -- registering scheduler.");
@@ -1391,9 +1541,9 @@ export default function({ xo }) {
       if (act.startsWith("Run Now")) {
         logInfo("=== RUN NOW triggered from UI ===", true);
         startRunSummary();
+        await rotateLogIfNeeded(_logPath, getLogBackupPath(_config));
         const results = [];
 
-        // Step 1: Performance
         if (_config.enablePerformance) {
           await enforcePerformance(xo, _config);
           results.push("performance: done");
@@ -1402,14 +1552,11 @@ export default function({ xo }) {
           results.push("performance: disabled");
         }
 
-        // Step 2: CSV Sync
         const csvResult = await runCsvSync(xo, _config);
         results.push("csv-sync: " + (csvResult.error ? "error -- " + csvResult.error : "done"));
 
-        // Step 3: Permission Autopilot (CSV-sourced, runs on schedule + Run Now)
         if (_config.enablePermissionAutopilot) {
           const updatedConfig = await runPermissionAutopilot(xo, _config);
-          // Persist autopilotStartDate if newly set this run
           if (updatedConfig.autopilotStartDate !== _config.autopilotStartDate) {
             _config = updatedConfig;
           }
@@ -1419,10 +1566,9 @@ export default function({ xo }) {
           results.push("autopilot: disabled");
         }
 
-        // Step 4: Standard Permission Sync (tag-driven, OnDemand only)
         if (_config.enablePermissions) {
           await enforcePermissions(xo, _config);
-          results.push("permissions: done (OnDemand)");
+          results.push("permissions: done");
         } else {
           logInfo("Permissions disabled -- skipping.");
           results.push("permissions: disabled");
@@ -1450,9 +1596,10 @@ export default function({ xo }) {
     apiMethods: {
       getCsv: async function() {
         try {
-          const content = await readFile(_config.csvPath, "utf8");
-          logInfo("getCsv: read " + content.length + " bytes from " + _config.csvPath);
-          return { content, path: _config.csvPath };
+          const csvPath = getCsvPath(_config);
+          const content = await readFile(csvPath, "utf8");
+          logInfo("getCsv: read " + content.length + " bytes from " + csvPath);
+          return { content, path: csvPath };
         } catch (err) {
           throw new Error("Could not read CSV: " + err.message);
         }
@@ -1464,37 +1611,39 @@ export default function({ xo }) {
         if (!validation.valid) {
           throw new Error("CSV validation failed: " + validation.error);
         }
+        const csvPath = getCsvPath(_config);
         try {
-          await mkdir(dirname(_config.csvPath), { recursive: true });
-          await writeFile(_config.csvPath, content, "utf8");
-          logInfo("saveCsv: wrote " + content.length + " bytes (" + validation.rowCount + " rows) to " + _config.csvPath);
-          return { saved: true, path: _config.csvPath, rowCount: validation.rowCount };
+          await mkdir(dirname(csvPath), { recursive: true });
+          await writeFile(csvPath, content, "utf8");
+          logInfo("saveCsv: wrote " + content.length + " bytes (" + validation.rowCount + " rows) to " + csvPath);
+          return { saved: true, path: csvPath, rowCount: validation.rowCount };
         } catch (err) {
           throw new Error("Could not save CSV: " + err.message);
         }
       },
 
-      exportCsv:     async function()       { return await exportCsv(xo, _config); },
-      refreshCsvNow: async function() {
+      exportCsv:      async function()       { return await exportCsv(xo, _config); },
+      refreshCsvNow:  async function() {
         const result = await exportCsv(xo, _config);
         return {
           message: "CSV refreshed -- " + result.exported + " VMs written to " + result.path,
           exported: result.exported,
-          path: result.path,
-          dryRun: result.dryRun,
+          path:     result.path,
+          dryRun:   result.dryRun,
         };
       },
-      downloadCsvApi: async function()         { return await downloadCsv(_config); },
-      uploadCsvApi:   async function(params)   { return await uploadCsv(_config, params && params.content); },
+      downloadCsvApi: async function()       { return await downloadCsv(_config); },
+      uploadCsvApi:   async function(params) { return await uploadCsv(_config, params && params.content); },
 
       getLog: async function(params) {
-        const lines = (params && params.lines) || 50;
+        const lines   = (params && params.lines) || 50;
+        const logPath = getLogPath(_config);
         try {
-          const content  = await readFile(_config.logPath, "utf8");
+          const content  = await readFile(logPath, "utf8");
           const allLines = content.split("\n");
           return {
             content: allLines.slice(-lines).join("\n"),
-            path: _config.logPath,
+            path: logPath,
             totalLines: allLines.length,
             showing: Math.min(lines, allLines.length),
           };
@@ -1504,13 +1653,14 @@ export default function({ xo }) {
       },
 
       getSummaryLog: async function(params) {
-        const lines = (params && params.lines) || 20;
+        const lines       = (params && params.lines) || 20;
+        const summaryPath = getSummaryLogPath(_config);
         try {
-          const content  = await readFile(_summaryPath, "utf8");
+          const content  = await readFile(summaryPath, "utf8");
           const allLines = content.split("\n");
           return {
             content: allLines.slice(-lines).join("\n"),
-            path: _summaryPath,
+            path: summaryPath,
             totalLines: allLines.length,
             showing: Math.min(lines, allLines.length),
           };
@@ -1558,6 +1708,17 @@ export default function({ xo }) {
           weeks: effectiveWeeks,
           elapsedDays,
           daysRemaining,
+        };
+      },
+
+      getFilePaths: async function() {
+        return {
+          nfsSharePath:  _config.nfsSharePath,
+          currentVmsCsv: getCsvPath(_config),
+          preloadVmsCsv: getPreloadPath(_config),
+          logFile:       getLogPath(_config),
+          logBackup:     getLogBackupPath(_config),
+          summaryLog:    getSummaryLogPath(_config),
         };
       },
     },
