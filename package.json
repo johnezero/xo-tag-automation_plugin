@@ -1,6 +1,6 @@
 {
   "name": "xo-tag-automation",
-  "version": "0.7.3",
+  "version": "0.7.5",
   "description": "Tag-based VM automation for Xen Orchestra - performance tier enforcement, permission group assignment, and CSV-driven tag/notes management via NFS share",
   "author": "john olsen",
   "license": "MIT",
