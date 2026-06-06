@@ -36,14 +36,14 @@
         "tagSuffix": {
           "type": "string",
           "title": "Tag Suffix",
-          "description": "Pool-specific suffix appended to performance tags (e.g. -v for POOL-V, -1 for POOL-1). Leave blank for generic.",
+          "description": "Pool-specific suffix , for granular control by pool (e.g. -v for POOL-V, -1 for POOL-1). Leave blank for generic.",
           "default": "-v"
         },
 
         "schedule": {
           "type": "string",
           "title": "Enforcement Schedule",
-          "description": "How often to automatically run enabled modules (Performance, CSV Sync, Permission Autopilot).",
+          "description": "How often to run Performance, CSV Sync, and Permission Autopilot.",
           "enum": ["hourly", "daily", "disabled"],
           "default": "daily"
         },
@@ -57,7 +57,7 @@
 
         "enablePerformance": {
           "type": "boolean",
-          "title": "Enable Performance Enforcement",
+          "title": "Enable Performance Sync",
           "description": "Apply CPU weights and IO priorities based on VM performance tier tags (0-core, 1-high, 2-normal, 3-low).",
           "default": false
         },
@@ -72,7 +72,7 @@
         "enablePermissionAutopilot": {
           "type": "boolean",
           "title": "Enable Permission Autopilot",
-          "description": "CSV-sourced permission enforcement. Reads -Admin / -Operator / -Viewer tags from current-vms.csv (CurrentTags column) and preload-vms.csv (Tags column) only -- does NOT read live VM tags.\nRuns on set schedule AND via Run Now.\nToggle OFF to disable, toggle ON to activate -- no window or timer, runs every cycle while enabled.\nIMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
+          "description": "Automatically assigns permissions and performance settings using CSV files stored on a secure NFS share: CURRENT-VMS.CSV – Contains existing VMs. To make changes, add performance and/or permission tags to the NewTags column. Changes are applied during the next Autopilot run. PRELOAD-VMS.CSV – Used to predefine settings for VMs being added or migrated to XCP-ng. Autopilot monitors for matching VM names and automatically applies the specified NewTags and Notes when the VM is detected, then adds the VM to current-vms.csv for ongoing management. Example: Set the NewTags value for VM My-VM1 to 2-normal-1;Dept1-Operator. On the next run, Autopilot will set the VM CPU weight to Normal and create (if needed) and assign the Dept1-Operator group with the appropriate VM permissions. IMPORTANT: Verify that your NFS share is properly configured and secured before enabling this feature. If you are not actively performing VM migrations or onboarding projects, Autopilot should be disabled until it is needed again.",
           "default": false
         },
 
