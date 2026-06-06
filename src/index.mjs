@@ -1,42 +1,41 @@
 // ============================================================
-// xo-server-tag-automation v0.7.5
+// xo-server-tag-automation v0.7.6
 // Tag-Based VM Automation Plugin for Xen Orchestra
 //
-// Changes in v0.7.5:
-// - NEW: autopilot-state.json on NFS share replaces the
-//        autopilotStartDate config schema field entirely.
-//        Stores { autopilotStartDate, autopilotWeeks } as a
-//        small JSON file at <nfsSharePath>/autopilot-state.json
-//        Survives xo-server restarts. Non-fatal if NFS is
-//        temporarily unavailable (falls back to in-memory).
-// - REMOVED: autopilotStartDate from configurationSchema,
-//        DEFAULTS, configure(), and all config references.
-// - CHANGED: autopilotWeeks description updated to reflect
-//        state file reset procedure (no UI field to clear).
-// - CHANGED: runPermissionAutopilot() reads/writes state file.
-//        Still logs Start Date, End Date, Elapsed, Remaining
-//        on every active run.
-// - CHANGED: test() Run Now result still shows full Autopilot
-//        status inline (start date, end date, days remaining).
-// - CHANGED: getAutopilotStatus() apiMethod reads state file.
-// - CHANGED: getFilePaths() apiMethod now includes
-//        autopilotStateFile path.
-// - CHANGED: configurationSchema description updated -- no
-//        longer mentions autopilotStartDate field.
+// Changes in v0.7.6:
+// - REMOVED: autopilot-state.json, autopilotStartDate,
+//        autopilotWeeks, and all window/timer logic.
+//        Permission Autopilot is now controlled solely
+//        by the enablePermissionAutopilot toggle.
+// - REMOVED: addDays(), autopilotStatusSummary(),
+//        readAutopilotState(), writeAutopilotState()
+//        helpers -- no longer needed.
+// - CHANGED: runPermissionAutopilot() simplified --
+//        if enabled, runs enforcePermissionsFromCsv()
+//        unconditionally. No window, no state file.
+// - CHANGED: UI descriptions updated from uploaded
+//        package.json.txt (tagSuffix default, schedule
+//        default, button labels, field descriptions).
+// - CHANGED: enablePermissions description updated to
+//        "Watcher-only" model per package.json.txt.
+// - NEW: daily-summary.log on NFS share, updated at
+//        midnight each day via a midnight scheduler job.
+//        Tallies total VM count and newly added VMs
+//        for that day. Stored at:
+//        <nfsSharePath>/logs/daily-summary.log
+// - NEW: getDailySummary apiMethod -- returns the last
+//        N lines of daily-summary.log for display.
+// - NEW: lastDailySummary read-only string field in
+//        configurationSchema -- displays the most recent
+//        daily summary record in the plugin UI.
+//        (Populated via getDailySummary apiMethod call.)
+// - CHANGED: getFilePaths() now includes dailySummaryLog.
+// - CHANGED: configurationSchema description updated --
+//        no mention of autopilotStartDate or state file.
 //
-// TO RESET THE AUTOPILOT WINDOW:
-//   1. Set autopilotWeeks to 0, click Save  (pauses instantly)
-//   2. Delete autopilot-state.json from your NFS share
-//   3. Set autopilotWeeks to new value, click Save
-//   4. Click Run Now -- new state file written automatically
-//
-// RETAINED from v0.7.4:
-// - All v0.7.4 UI/description changes
-// - runPermissionAutopilot() status block logging
-// - test() enriched Run Now result string
-// - addDays() / autopilotStatusSummary() helpers
-//
-// RETAINED from v0.7.3: All bug fixes and features unchanged.
+// RETAINED from v0.7.5: All NFS state file infrastructure
+//   replaced -- all other features unchanged.
+// RETAINED from v0.7.3: All CSV/preload bug fixes.
 // ============================================================
 
 import { readFile, writeFile, mkdir, appendFile, rename } from "fs/promises";
@@ -46,24 +45,23 @@ import { dirname, join, basename } from "path";
 // ============================================================
 // LOCKED FILENAMES -- controlled internally, not user-editable
 // ============================================================
-const FILE_CURRENT_VMS    = "current-vms.csv";
-const FILE_PRELOAD_VMS    = "preload-vms.csv";
-const FILE_LOG            = "xo-tag-automation.log";
-const FILE_LOG_BACKUP     = "xo-tag-automation.log.1";
-const FILE_SUMMARY_LOG    = "xo-tag-automation-summary.log";
-const FILE_AUTOPILOT_STATE = "autopilot-state.json";
-const LOG_MAX_BYTES       = 2 * 1024 * 1024; // 2MB rotation threshold
+const FILE_CURRENT_VMS     = "current-vms.csv";
+const FILE_PRELOAD_VMS     = "preload-vms.csv";
+const FILE_LOG             = "xo-tag-automation.log";
+const FILE_LOG_BACKUP      = "xo-tag-automation.log.1";
+const FILE_SUMMARY_LOG     = "xo-tag-automation-summary.log";
+const FILE_DAILY_SUMMARY   = "daily-summary.log";
+const LOG_MAX_BYTES        = 2 * 1024 * 1024; // 2MB rotation threshold
 
 // ============================================================
 // DEFAULTS
 // ============================================================
 const DEFAULTS = {
-  tagSuffix: "-v",
+  tagSuffix: "-1",
   enablePerformance: false,
   enablePermissions: false,
   enablePermissionAutopilot: false,
-  autopilotWeeks: 0,
-  schedule: "daily",
+  schedule: "hourly",
   dryRun: true,
   nfsSharePath: "/mnt/v0/code/tag-automation",
   stalenessWarnDays: 7,
@@ -87,46 +85,7 @@ function getPreloadPath(config)       { return join(config.nfsSharePath, FILE_PR
 function getLogPath(config)           { return join(config.nfsSharePath, "logs", FILE_LOG); }
 function getLogBackupPath(config)     { return join(config.nfsSharePath, "logs", FILE_LOG_BACKUP); }
 function getSummaryLogPath(config)    { return join(config.nfsSharePath, "logs", FILE_SUMMARY_LOG); }
-function getAutopilotStatePath(config){ return join(config.nfsSharePath, FILE_AUTOPILOT_STATE); }
-
-// ============================================================
-// AUTOPILOT STATE FILE -- read/write/delete
-// Stores: { autopilotStartDate: "YYYY-MM-DD", autopilotWeeks: N }
-// Non-fatal on all errors -- falls back gracefully.
-// ============================================================
-async function readAutopilotState(config) {
-  const statePath = getAutopilotStatePath(config);
-  try {
-    if (!existsSync(statePath)) return null;
-    const raw  = await readFile(statePath, "utf8");
-    const data = JSON.parse(raw);
-    if (data && data.autopilotStartDate) {
-      logInfo("Autopilot state loaded from " + FILE_AUTOPILOT_STATE +
-              " -- startDate=" + data.autopilotStartDate +
-              " weeks=" + data.autopilotWeeks);
-      return data;
-    }
-    return null;
-  } catch (err) {
-    logWarn("Could not read " + FILE_AUTOPILOT_STATE + ": " + err.message +
-            " -- will reinitialize on next run.");
-    return null;
-  }
-}
-
-async function writeAutopilotState(config, startDate, weeks) {
-  const statePath = getAutopilotStatePath(config);
-  const data = JSON.stringify({ autopilotStartDate: startDate, autopilotWeeks: weeks }, null, 2);
-  try {
-    await mkdir(dirname(statePath), { recursive: true });
-    await writeFile(statePath, data, "utf8");
-    logInfo("Autopilot state saved to " + FILE_AUTOPILOT_STATE +
-            " -- startDate=" + startDate + " weeks=" + weeks);
-  } catch (err) {
-    logWarn("Could not write " + FILE_AUTOPILOT_STATE + ": " + err.message +
-            " -- state will not persist across restarts until NFS is available.");
-  }
-}
+function getDailySummaryPath(config)  { return join(config.nfsSharePath, "logs", FILE_DAILY_SUMMARY); }
 
 // ============================================================
 // NFS FILE LOGGING
@@ -197,28 +156,59 @@ function endRunSummary(results) {
 }
 
 // ============================================================
-// AUTOPILOT DATE HELPERS -- v0.7.4+
+// DAILY SUMMARY LOG -- v0.7.6
+// Written once per day at midnight by the midnight scheduler.
+// Tallies total VM count and newly added VMs for that day.
+// Format per line:
+//   [YYYY-MM-DD] Total VMs: N | New VMs today: N | New VM names: name1, name2, ...
 // ============================================================
-function addDays(dateStr, days) {
-  const d = new Date(dateStr);
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+async function writeDailySummary(config, xo) {
+  const dailyPath = getDailySummaryPath(config);
+  const date      = new Date().toISOString().slice(0, 10);
+
+  try {
+    const allVms    = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
+    const totalVms  = allVms.length;
+
+    // Detect new VMs: VMs not yet in current-vms.csv
+    let newVmNames = [];
+    const csvPath  = getCsvPath(config);
+    if (existsSync(csvPath)) {
+      try {
+        const raw      = await readFile(csvPath, "utf8");
+        const lines    = raw.split("\n").filter(function(l) { return l.trim() && !l.startsWith("#"); });
+        const csvUuids = new Set();
+        // Skip header row
+        for (let i = 1; i < lines.length; i++) {
+          const cols = parseCsvLine(lines[i]);
+          if (cols[0]) csvUuids.add(cols[0].trim());
+        }
+        for (let i = 0; i < allVms.length; i++) {
+          if (!csvUuids.has(allVms[i].uuid)) {
+            newVmNames.push(allVms[i].name_label);
+          }
+        }
+      } catch (err) {
+        logWarn("Daily summary: could not read " + FILE_CURRENT_VMS + " for new VM detection: " + err.message);
+      }
+    }
+
+    const newCount  = newVmNames.length;
+    const newNames  = newCount > 0 ? newVmNames.join(", ") : "none";
+    const line      = "[" + date + "] Total VMs: " + totalVms +
+                      " | New VMs today: " + newCount +
+                      " | New VM names: " + newNames;
+
+    await mkdir(dirname(dailyPath), { recursive: true });
+    await appendFile(dailyPath, line + "\n", "utf8");
+    logInfo("Daily summary written -- " + line, true);
+  } catch (err) {
+    logWarn("Could not write daily summary: " + err.message);
+  }
 }
 
-function autopilotStatusSummary(startDateStr, weeks) {
-  if (!startDateStr) return null;
-  const effectiveWeeks = Math.min(weeks, 4);
-  const windowDays     = effectiveWeeks * 7;
-  const endDateStr     = addDays(startDateStr, windowDays);
-  const elapsedMs      = Date.now() - new Date(startDateStr).getTime();
-  const elapsedDays    = Math.floor(elapsedMs / (1000 * 60 * 60 * 24));
-  const daysRemaining  = Math.max(0, windowDays - elapsedDays);
-  const expired        = elapsedMs > windowDays * 24 * 60 * 60 * 1000;
-  return { startDateStr, endDateStr, effectiveWeeks, windowDays, elapsedDays, daysRemaining, expired };
-}
-
 // ============================================================
-// MIGRATION HELPER -- v0.7.0 + v0.7.3
+// MIGRATION HELPER -- v0.7.0+
 // ============================================================
 async function migrateVmMetadataCsv(config) {
   const shareDir   = config.nfsSharePath;
@@ -592,81 +582,26 @@ async function enforcePermissions(xo, config) {
 }
 
 // ============================================================
-// PERMISSION AUTOPILOT MODULE -- v0.7.5
-// State (startDate + weeks) persisted to autopilot-state.json
-// on the NFS share. Survives xo-server restarts.
-// Non-fatal if NFS unavailable -- falls back to in-memory.
+// PERMISSION AUTOPILOT MODULE -- v0.7.6 SIMPLIFIED
+// Controlled solely by enablePermissionAutopilot toggle.
+// No window, no state file, no date tracking.
+// When enabled: runs enforcePermissionsFromCsv() on every
+// scheduled run AND every Run Now.
 // ============================================================
 async function runPermissionAutopilot(xo, config) {
   if (!config.enablePermissionAutopilot) {
     logInfo("Permission Autopilot disabled -- skipping.");
-    return { autopilotResult: "disabled" };
+    return "disabled";
   }
-
-  let weeks = parseInt(config.autopilotWeeks, 10);
-  if (isNaN(weeks) || weeks === 0) {
-    logInfo("Permission Autopilot paused (autopilotWeeks=0) -- skipping.");
-    return { autopilotResult: "paused" };
-  }
-
-  if (weeks > 4) {
-    logWarn("Permission Autopilot: autopilotWeeks=" + weeks + " exceeds safety cap of 4 -- clamping to 4 weeks.", true);
-    weeks = 4;
-  }
-
-  // Read persisted state from NFS share
-  let state     = await readAutopilotState(config);
-  let startDate = state ? state.autopilotStartDate : null;
-
-  // First run -- initialize state file
-  if (!startDate) {
-    startDate = new Date().toISOString().slice(0, 10);
-    logInfo(
-      "Permission Autopilot: no state file found -- initializing startDate=" + startDate +
-      " weeks=" + weeks + " and writing " + FILE_AUTOPILOT_STATE, true
-    );
-    await writeAutopilotState(config, startDate, weeks);
-  }
-
-  const status = autopilotStatusSummary(startDate, weeks);
-
-  if (status.expired) {
-    logWarn(
-      "=== Permission Autopilot EXPIRED ===" +
-      " | Start: "   + status.startDateStr +
-      " | End: "     + status.endDateStr +
-      " | Elapsed: " + status.elapsedDays + " day(s)" +
-      " | Window was: " + status.effectiveWeeks + " week(s) (" + status.windowDays + " days)" +
-      " | TO RESET: set autopilotWeeks=0, Save, delete " + FILE_AUTOPILOT_STATE +
-      " from NFS share, set new week value, Save, Run Now. ===",
-      true
-    );
-    return {
-      autopilotResult: "EXPIRED | started " + status.startDateStr + " | ended " + status.endDateStr,
-    };
-  }
-
-  logWarn(
-    "=== SECURITY NOTICE: Permission Autopilot is running (CSV-sourced) ===" +
-    " | Start: "     + status.startDateStr +
-    " | End: "       + status.endDateStr +
-    " | Elapsed: "   + status.elapsedDays + " day(s)" +
-    " | Remaining: " + status.daysRemaining + " day(s) ===",
-    true
-  );
-
+  logWarn("=== SECURITY NOTICE: Permission Autopilot is running (CSV-sourced) ===", true);
   await enforcePermissionsFromCsv(xo, config);
-
-  const resultStr =
-    "ACTIVE | started " + status.startDateStr +
-    " | expires " + status.endDateStr +
-    " | " + status.daysRemaining + " day(s) remaining";
-
-  return { autopilotResult: resultStr };
+  return "done";
 }
 
 // ============================================================
 // ENFORCE PERMISSIONS FROM CSV -- v0.7.3
+// Source 1: current-vms.csv (CurrentTags col, matched by UUID)
+// Source 2: preload-vms.csv (Tags col, matched by VM name)
 // ============================================================
 async function enforcePermissionsFromCsv(xo, config) {
   const dryRun      = config.dryRun;
@@ -899,8 +834,8 @@ async function processPreloadVms(xo, config, mainCsvRows) {
 // CSV SYNC MODULE
 // ============================================================
 async function runCsvSync(xo, config) {
-  const dryRun          = config.dryRun;
-  const csvPath         = getCsvPath(config);
+  const dryRun            = config.dryRun;
+  const csvPath           = getCsvPath(config);
   const stalenessWarnDays = config.stalenessWarnDays;
   logInfo("=== CSV Sync starting (dryRun=" + dryRun + ", path=" + csvPath + ") ===", true);
   if (!existsSync(csvPath)) { logWarn(FILE_CURRENT_VMS + " not found at " + csvPath + " -- run Export CSV first.", true); return { error: "CSV not found" }; }
@@ -1025,27 +960,27 @@ function getCron(schedule) {
 }
 
 // ============================================================
-// CONFIGURATION SCHEMA -- v0.7.5
-// autopilotStartDate field REMOVED -- state persisted to
-// autopilot-state.json on NFS share instead.
+// CONFIGURATION SCHEMA -- v0.7.6
+// autopilotWeeks, autopilotStartDate REMOVED.
+// Autopilot controlled solely by enablePermissionAutopilot.
+// New: lastDailySummary read-only display field.
 // ============================================================
 export const configurationSchema = {
   type: "object",
   description:
     "IMPORTANT -- The 'Delete configuration' button resets all plugin settings to their defaults. " +
     "It does not delete any VMs, tags, groups, resource sets, or CSV files on your NFS share. " +
-    "The Autopilot window state is stored in " + FILE_AUTOPILOT_STATE + " on your NFS share -- " +
-    "deleting that file resets the Autopilot window clock.",
+    "It is safe to use if you want to reset the plugin configuration.",
   properties: {
     tagSuffix: {
       type: "string", title: "Tag Suffix",
-      description: "Pool-specific suffix of performance tags, for granular control by pool (e.g. '-v' for POOL-V, '-1' for POOL-1).",
-      default: "-v",
+      description: "Pool-specific suffix appended to performance tags (e.g. '-1' for POOL-1, '-v' for POOL-V). Leave blank for generic.",
+      default: "-1",
     },
     schedule: {
       type: "string", title: "Enforcement Schedule",
-      description: "How often to run Performance, CSV Sync, and Permission Autopilot.",
-      enum: ["hourly", "daily", "disabled"], default: "daily",
+      description: "How often to automatically run enabled modules (Performance, CSV Sync, Permission Autopilot).",
+      enum: ["hourly", "daily", "disabled"], default: "hourly",
     },
     dryRun: {
       type: "boolean", title: "Dry-Run / Export-CSV",
@@ -1056,53 +991,49 @@ export const configurationSchema = {
       default: true,
     },
     enablePerformance: {
-      type: "boolean", title: "Enable Performance Enforcement",
-      description: "Apply CPU weights and IO priorities based on VM performance tier tags (0-core, 1-high, 2-normal, 3-low).",
+      type: "boolean", title: "Enable Performance Sync",
+      description: "Apply CPU weights and IO priorities based on 0-core / 1-high / 2-normal / 3-low tags.",
       default: false,
     },
     enablePermissions: {
       type: "boolean", title: "Enable Permission Sync",
       description:
-        "Tags ending in -Admin / -Operator / -Viewer trigger group creation and ACL assignments. " +
+        "Tags ending in -Admin / -Operator / -Viewer trigger group creation and ACL assignments appropriately. " +
         "IMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
       default: false,
     },
     enablePermissionAutopilot: {
       type: "boolean", title: "Enable Permission Autopilot",
       description:
-        "CSV-sourced permission enforcement. Reads -Admin/-Operator/-Viewer tags from " +
-        FILE_CURRENT_VMS + " (CurrentTags column) and " + FILE_PRELOAD_VMS + " (Tags column) only -- " +
-        "does NOT read live VM tags. Runs on set schedule AND via Run Now. " +
-        "Set Autopilot Window to 0 to pause, or 1-4 to activate for that many weeks. " +
+        "CSV-sourced permission enforcement. " +
+        "Reads -Admin / -Operator / -Viewer tags from current-vms.csv (CurrentTags column) and preload-vms.csv (Tags column) only -- does NOT read live VM tags. " +
+        "Runs on set schedule AND via Run Now. " +
+        "Toggle OFF to disable, toggle ON to activate -- no window or timer, runs every cycle while enabled. " +
         "IMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
       default: false,
-    },
-    autopilotWeeks: {
-      type: "integer", title: "Autopilot Window (weeks)",
-      description:
-        "Number of weeks the Permission Autopilot will run from its start date. " +
-        "0 = paused (instant off switch, window timer is preserved). " +
-        "1-4 = active window (safety cap -- values above 4 are clamped to 4). " +
-        "Default is 0 -- you must intentionally set a value to activate. " +
-        "Autopilot start date and status are stored in " + FILE_AUTOPILOT_STATE + " on your NFS share " +
-        "and shown in XO logs and the Run Now result on every run. " +
-        "TO RESET THE WINDOW: set to 0, Save, delete " + FILE_AUTOPILOT_STATE + " from NFS share, " +
-        "set new value, Save, Run Now.",
-      default: 0, minimum: 0, maximum: 10,
     },
     nfsSharePath: {
       type: "string", title: "NFS Share Path",
       description:
         "Base path to your NFS share directory. All plugin files are managed here automatically: " +
-        FILE_CURRENT_VMS + ", " + FILE_PRELOAD_VMS + ", " + FILE_AUTOPILOT_STATE + ", " +
-        "logs/" + FILE_LOG + ", logs/" + FILE_SUMMARY_LOG + ". " +
-        "Log files are automatically rotated at 2MB (one backup kept as " + FILE_LOG_BACKUP + ").",
+        FILE_CURRENT_VMS + ", " + FILE_PRELOAD_VMS + ", " +
+        "logs/" + FILE_LOG + ", logs/" + FILE_SUMMARY_LOG + ", logs/" + FILE_DAILY_SUMMARY + ". " +
+        "Main log auto-rotates at 2MB (one backup kept as " + FILE_LOG_BACKUP + ").",
       default: "/mnt/v0/code/tag-automation",
     },
     stalenessWarnDays: {
       type: "integer", title: "CSV Age Warning (days)",
       description: "Warn in logs if " + FILE_CURRENT_VMS + " has not been exported in this many days.",
       default: 7,
+    },
+    lastDailySummary: {
+      type: "string", title: "Last Daily Summary (auto-updated at midnight)",
+      description:
+        "Displays the most recent entry from " + FILE_DAILY_SUMMARY + " on your NFS share. " +
+        "Updated automatically at midnight each day. " +
+        "Shows total VM count and newly added VMs for that day. " +
+        "Use the getDailySummary apiMethod via xo-cli to view full history.",
+      default: "(not yet available -- will populate after first midnight run)",
     },
     performanceTiers: {
       type: "object", title: "Performance Tier Settings",
@@ -1126,10 +1057,11 @@ export const configurationSchema = {
 // DEFAULT EXPORT -- Plugin Factory
 // ============================================================
 export default function({ xo }) {
-  let _config  = Object.assign({}, DEFAULTS);
-  let _job     = null;
-  _logPath     = getLogPath(DEFAULTS);
-  _summaryPath = getSummaryLogPath(DEFAULTS);
+  let _config      = Object.assign({}, DEFAULTS);
+  let _job         = null;
+  let _midnightJob = null;
+  _logPath         = getLogPath(DEFAULTS);
+  _summaryPath     = getSummaryLogPath(DEFAULTS);
 
   logInfo("Plugin factory called -- xo context: " + (xo ? "YES" : "NO"));
   logWarn("SECURITY REMINDER: Ensure NFS share is secured before enabling Permissions or Autopilot.");
@@ -1137,6 +1069,8 @@ export default function({ xo }) {
   function startScheduler() {
     if (_config.schedule === "disabled") { logInfo("Schedule disabled -- skipping."); return; }
     if (!xo.scheduler) { logWarn("xo.scheduler not available -- manual runs only."); return; }
+
+    // Main enforcement job
     _job = xo.scheduler.createJob({
       name: "xo-tag-automation-enforcement",
       cron: getCron(_config.schedule),
@@ -1151,6 +1085,17 @@ export default function({ xo }) {
       },
     });
     logInfo("Scheduler registered -- cron=" + getCron(_config.schedule));
+
+    // Midnight daily summary job -- runs at 00:00 every day regardless of main schedule
+    _midnightJob = xo.scheduler.createJob({
+      name: "xo-tag-automation-daily-summary",
+      cron: "0 0 * * *",
+      fn: async function() {
+        logInfo("=== Daily summary job triggered (midnight) ===");
+        await writeDailySummary(_config, xo);
+      },
+    });
+    logInfo("Daily summary scheduler registered -- cron=0 0 * * *");
   }
 
   return {
@@ -1164,7 +1109,6 @@ export default function({ xo }) {
         "Configured -- suffix=" + _config.tagSuffix + " schedule=" + _config.schedule +
         " dryRun=" + _config.dryRun + " perf=" + _config.enablePerformance +
         " perms=" + _config.enablePermissions + " autopilot=" + _config.enablePermissionAutopilot +
-        " autopilotWeeks=" + _config.autopilotWeeks +
         " nfsSharePath=" + _config.nfsSharePath
       );
     },
@@ -1179,7 +1123,8 @@ export default function({ xo }) {
     },
 
     unload: async function() {
-      if (_job) { _job.stop(); _job = null; logInfo("Scheduler stopped."); }
+      if (_job)         { _job.stop();         _job         = null; logInfo("Scheduler stopped."); }
+      if (_midnightJob) { _midnightJob.stop();  _midnightJob = null; logInfo("Daily summary scheduler stopped."); }
     },
 
     test: async function(params) {
@@ -1199,13 +1144,8 @@ export default function({ xo }) {
         const csvResult = await runCsvSync(xo, _config);
         results.push("csv-sync: " + (csvResult.error ? "error -- " + csvResult.error : "done"));
 
-        if (_config.enablePermissionAutopilot) {
-          const { autopilotResult } = await runPermissionAutopilot(xo, _config);
-          results.push("autopilot: " + autopilotResult);
-        } else {
-          logInfo("Permission Autopilot disabled -- skipping.");
-          results.push("autopilot: disabled");
-        }
+        const autopilotResult = await runPermissionAutopilot(xo, _config);
+        results.push("autopilot: " + autopilotResult);
 
         if (_config.enablePermissions) { await enforcePermissions(xo, _config); results.push("permissions: done"); }
         else { logInfo("Permissions disabled -- skipping."); results.push("permissions: disabled"); }
@@ -1222,6 +1162,11 @@ export default function({ xo }) {
           "NewTags and NewNotes columns are blank and ready to fill in. " +
           "Open the CSV from your NFS share, make your edits, then use xo-cli uploadCsvApi to push it back."
         );
+      }
+
+      if (act.startsWith("Write Daily Summary")) {
+        await writeDailySummary(_config, xo);
+        return "Daily summary written to " + getDailySummaryPath(_config) + ". Check XO logs for details.";
       }
 
       throw new Error("Unknown action: \"" + act + "\". Please select a valid action from the dropdown.");
@@ -1262,26 +1207,31 @@ export default function({ xo }) {
         try { const content = await readFile(summaryPath, "utf8"); const allLines = content.split("\n"); return { content: allLines.slice(-lines).join("\n"), path: summaryPath, totalLines: allLines.length, showing: Math.min(lines, allLines.length) }; }
         catch (err) { throw new Error("Could not read summary log: " + err.message); }
       },
-      runSync: async function() { return await runCsvSync(xo, _config); },
-      getAutopilotStatus: async function() {
-        const weeks = parseInt(_config.autopilotWeeks, 10) || 0;
-        if (!_config.enablePermissionAutopilot) return { status: "disabled", message: "Permission Autopilot is not enabled." };
-        if (weeks === 0) return { status: "paused", message: "Autopilot is paused (autopilotWeeks=0)." };
-        const state = await readAutopilotState(_config);
-        if (!state || !state.autopilotStartDate) return { status: "pending", message: "Autopilot enabled but " + FILE_AUTOPILOT_STATE + " not found -- will initialize on next run." };
-        const s = autopilotStatusSummary(state.autopilotStartDate, weeks);
-        if (s.expired) return { status: "expired", message: "Autopilot window expired.", startDate: s.startDateStr, endDate: s.endDateStr, weeks: s.effectiveWeeks, elapsedDays: s.elapsedDays, daysRemaining: 0 };
-        return { status: "active", message: "Autopilot active -- " + s.daysRemaining + " day(s) remaining.", startDate: s.startDateStr, endDate: s.endDateStr, weeks: s.effectiveWeeks, elapsedDays: s.elapsedDays, daysRemaining: s.daysRemaining };
+      getDailySummary: async function(params) {
+        const lines       = (params && params.lines) || 30;
+        const dailyPath   = getDailySummaryPath(_config);
+        try {
+          if (!existsSync(dailyPath)) return { content: "(no daily summary yet -- will be written at midnight)", path: dailyPath, totalLines: 0, showing: 0 };
+          const content   = await readFile(dailyPath, "utf8");
+          const allLines  = content.split("\n").filter(function(l) { return l.trim(); });
+          const lastLine  = allLines.length > 0 ? allLines[allLines.length - 1] : "(empty)";
+          return { content: allLines.slice(-lines).join("\n"), lastEntry: lastLine, path: dailyPath, totalLines: allLines.length, showing: Math.min(lines, allLines.length) };
+        } catch (err) { throw new Error("Could not read daily summary: " + err.message); }
       },
+      writeDailySummaryNow: async function() {
+        await writeDailySummary(_config, xo);
+        return "Daily summary written to " + getDailySummaryPath(_config);
+      },
+      runSync: async function() { return await runCsvSync(xo, _config); },
       getFilePaths: async function() {
         return {
-          nfsSharePath:       _config.nfsSharePath,
-          currentVmsCsv:      getCsvPath(_config),
-          preloadVmsCsv:      getPreloadPath(_config),
-          autopilotStateFile: getAutopilotStatePath(_config),
-          logFile:            getLogPath(_config),
-          logBackup:          getLogBackupPath(_config),
-          summaryLog:         getSummaryLogPath(_config),
+          nfsSharePath:    _config.nfsSharePath,
+          currentVmsCsv:  getCsvPath(_config),
+          preloadVmsCsv:  getPreloadPath(_config),
+          logFile:         getLogPath(_config),
+          logBackup:       getLogBackupPath(_config),
+          summaryLog:      getSummaryLogPath(_config),
+          dailySummaryLog: getDailySummaryPath(_config),
         };
       },
     },

@@ -1,11 +1,13 @@
 {
   "name": "xo-tag-automation",
-  "version": "0.7.5",
-  "description": "Tag-based VM automation for Xen Orchestra - performance tier enforcement, permission group assignment, and CSV-driven tag/notes management via NFS share",
+  "version": "0.7.6",
+  "description": "Tag-based VM automation for Xen Orchestra  Manage performance tiers, group and VM ACL assignment, based on existing tags and/or CSV import/export files.",
   "author": "john olsen",
   "license": "MIT",
   "main": "dist/index.js",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "cross-env NODE_ENV=production babel --source-maps --copy-files --out-dir=dist/ src/",
     "dev":   "cross-env NODE_ENV=development babel --watch --source-maps --copy-files --out-dir=dist/ src/",
@@ -13,35 +15,35 @@
   },
   "dependencies": {
     "@xen-orchestra/cron": "^1.0.7",
-    "@xen-orchestra/log": "^0.7.2",
-    "csv-parse": "^5.5.0",
-    "csv-stringify": "^6.4.0",
-    "lodash": "^4.17.21"
+    "@xen-orchestra/log":  "^0.7.2",
+    "csv-parse":           "^5.5.0",
+    "csv-stringify":       "^6.4.0",
+    "lodash":              "^4.17.21"
   },
   "devDependencies": {
-    "@babel/cli": "^7.0.0",
-    "@babel/core": "^7.0.0",
-    "@babel/preset-env": "^7.0.0",
-    "cross-env": "^7.0.2",
-    "rimraf": "^6.0.1"
+    "@babel/cli":          "^7.0.0",
+    "@babel/core":         "^7.0.0",
+    "@babel/preset-env":   "^7.0.0",
+    "cross-env":           "^7.0.2",
+    "rimraf":              "^6.0.1"
   },
   "xo-server-plugin": {
     "configurationSchema": {
       "type": "object",
-      "description": "IMPORTANT -- The 'Delete configuration' button resets all plugin settings to their defaults. It does not delete any VMs, tags, groups, resource sets, or CSV files on your NFS share. It is safe to use if you want to reset the plugin configuration. It also clears the autopilotStartDate, which resets the Autopilot window.",
+      "description": "IMPORTANT -- The 'Delete configuration' button resets all plugin settings to their defaults. It does not delete any VMs, tags, groups, resource sets, or CSV files on your NFS share. It is safe to use if you want to reset the plugin configuration.",
       "properties": {
 
         "tagSuffix": {
           "type": "string",
           "title": "Tag Suffix",
-          "description": "Pool-specific suffix of performance tags, for granular control by pool (e.g. '-v' for POOL-V, '-1' for POOL-1).",
+          "description": "Pool-specific suffix appended to performance tags (e.g. -v for POOL-V, -1 for POOL-1). Leave blank for generic.",
           "default": "-v"
         },
 
         "schedule": {
           "type": "string",
           "title": "Enforcement Schedule",
-          "description": "How often to run Performance, CSV Sync, and Permission Autopilot.",
+          "description": "How often to automatically run enabled modules (Performance, CSV Sync, Permission Autopilot).",
           "enum": ["hourly", "daily", "disabled"],
           "default": "daily"
         },
@@ -70,30 +72,14 @@
         "enablePermissionAutopilot": {
           "type": "boolean",
           "title": "Enable Permission Autopilot",
-          "description": "CSV-sourced permission enforcement. Reads -Admin/-Operator/-Viewer tags from current-vms.csv (CurrentTags column) and preload-vms.csv (Tags column) only -- does NOT read live VM tags. Runs on set schedule AND via Run Now. Set Autopilot Window to 0 to pause, or 1-4 to activate for that many weeks. IMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
+          "description": "CSV-sourced permission enforcement. Reads -Admin / -Operator / -Viewer tags from current-vms.csv (CurrentTags column) and preload-vms.csv (Tags column) only -- does NOT read live VM tags.\nRuns on set schedule AND via Run Now.\nToggle OFF to disable, toggle ON to activate -- no window or timer, runs every cycle while enabled.\nIMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
           "default": false
-        },
-
-        "autopilotWeeks": {
-          "type": "integer",
-          "title": "Autopilot Window (weeks)",
-          "description": "Number of weeks the Permission Autopilot will run from its start date. 0 = paused (instant off switch, window timer is preserved). 1-4 = active window (safety cap -- values above 4 are clamped to 4). Default is 0 -- you must intentionally set a value to activate.",
-          "default": 0,
-          "minimum": 0,
-          "maximum": 10
-        },
-
-        "autopilotStartDate": {
-          "type": "string",
-          "title": "Autopilot Start Date (auto-set)",
-          "description": "ISO date (YYYY-MM-DD) when the Autopilot window began. Set automatically on the first Autopilot run. Clear this field to reset the window start date on the next run. Cleared automatically if you click 'Delete configuration'.",
-          "default": ""
         },
 
         "nfsSharePath": {
           "type": "string",
           "title": "NFS Share Path",
-          "description": "Base path to your NFS share directory. All plugin files are managed here automatically: current-vms.csv, preload-vms.csv, logs/xo-tag-automation.log, logs/xo-tag-automation-summary.log. Log files are automatically rotated at 2MB (one backup kept as xo-tag-automation.log.1).",
+          "description": "Base path to your NFS share directory. All plugin files are managed here automatically: current-vms.csv, preload-vms.csv, logs/xo-tag-automation.log, logs/xo-tag-automation-summary.log, logs/daily-summary.log. Main log auto-rotates at 2MB (one backup kept as xo-tag-automation.log.1).",
           "default": "/mnt/v0/code/tag-automation"
         },
 
@@ -102,6 +88,13 @@
           "title": "CSV Age Warning (days)",
           "description": "Warn in logs if current-vms.csv has not been exported in this many days.",
           "default": 7
+        },
+
+        "lastDailySummary": {
+          "type": "string",
+          "title": "Last Daily Summary (auto-updated at midnight)",
+          "description": "Displays the most recent entry from daily-summary.log on your NFS share. Updated automatically at midnight each day. Shows total VM count and newly added VMs for that day. Use the getDailySummary apiMethod via xo-cli to view full history.",
+          "default": "(not yet available -- will populate after first midnight run)"
         },
 
         "performanceTiers": {
