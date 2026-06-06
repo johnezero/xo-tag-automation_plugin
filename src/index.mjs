@@ -1,5 +1,5 @@
 // ============================================================
-// xo-server-tag-automation v0.7.6
+// xo-server-tag-automation v0.7.7
 // Tag-Based VM Automation Plugin for Xen Orchestra
 //
 // Changes in v0.7.6:
