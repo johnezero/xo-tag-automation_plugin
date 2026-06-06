@@ -1,40 +1,22 @@
 // ============================================================
-// xo-server-tag-automation v0.7.7
+// xo-server-tag-automation v0.7.8
 // Tag-Based VM Automation Plugin for Xen Orchestra
 //
-// Changes in v0.7.6:
-// - REMOVED: autopilot-state.json, autopilotStartDate,
-//        autopilotWeeks, and all window/timer logic.
-//        Permission Autopilot is now controlled solely
-//        by the enablePermissionAutopilot toggle.
-// - REMOVED: addDays(), autopilotStatusSummary(),
-//        readAutopilotState(), writeAutopilotState()
-//        helpers -- no longer needed.
-// - CHANGED: runPermissionAutopilot() simplified --
-//        if enabled, runs enforcePermissionsFromCsv()
-//        unconditionally. No window, no state file.
-// - CHANGED: UI descriptions updated from uploaded
-//        package.json.txt (tagSuffix default, schedule
-//        default, button labels, field descriptions).
-// - CHANGED: enablePermissions description updated to
-//        "Watcher-only" model per package.json.txt.
-// - NEW: daily-summary.log on NFS share, updated at
-//        midnight each day via a midnight scheduler job.
-//        Tallies total VM count and newly added VMs
-//        for that day. Stored at:
-//        <nfsSharePath>/logs/daily-summary.log
-// - NEW: getDailySummary apiMethod -- returns the last
-//        N lines of daily-summary.log for display.
-// - NEW: lastDailySummary read-only string field in
-//        configurationSchema -- displays the most recent
-//        daily summary record in the plugin UI.
-//        (Populated via getDailySummary apiMethod call.)
-// - CHANGED: getFilePaths() now includes dailySummaryLog.
-// - CHANGED: configurationSchema description updated --
-//        no mention of autopilotStartDate or state file.
+// Changes in v0.7.8:
+// - REMOVED: lastDailySummary field from configurationSchema
+//        and DEFAULTS. The UI field is gone entirely.
+// - RETAINED: All daily summary backend code unchanged --
+//        writeDailySummary() still runs at midnight and
+//        writes to logs/daily-summary.log on NFS share.
+//        getDailySummary apiMethod still available via xo-cli.
+//        writeDailySummaryNow apiMethod still available.
+//        "Write Daily Summary" test() action still available.
 //
-// RETAINED from v0.7.5: All NFS state file infrastructure
-//   replaced -- all other features unchanged.
+// RETAINED from v0.7.7: All descriptions and UI changes
+//   from the live GitHub repo (enablePermissionAutopilot
+//   full description, tagSuffix, schedule, etc.)
+// RETAINED from v0.7.6: Daily summary backend, midnight
+//   scheduler, simplified Autopilot toggle.
 // RETAINED from v0.7.3: All CSV/preload bug fixes.
 // ============================================================
 
@@ -45,23 +27,23 @@ import { dirname, join, basename } from "path";
 // ============================================================
 // LOCKED FILENAMES -- controlled internally, not user-editable
 // ============================================================
-const FILE_CURRENT_VMS     = "current-vms.csv";
-const FILE_PRELOAD_VMS     = "preload-vms.csv";
-const FILE_LOG             = "xo-tag-automation.log";
-const FILE_LOG_BACKUP      = "xo-tag-automation.log.1";
-const FILE_SUMMARY_LOG     = "xo-tag-automation-summary.log";
-const FILE_DAILY_SUMMARY   = "daily-summary.log";
-const LOG_MAX_BYTES        = 2 * 1024 * 1024; // 2MB rotation threshold
+const FILE_CURRENT_VMS   = "current-vms.csv";
+const FILE_PRELOAD_VMS   = "preload-vms.csv";
+const FILE_LOG           = "xo-tag-automation.log";
+const FILE_LOG_BACKUP    = "xo-tag-automation.log.1";
+const FILE_SUMMARY_LOG   = "xo-tag-automation-summary.log";
+const FILE_DAILY_SUMMARY = "daily-summary.log";
+const LOG_MAX_BYTES      = 2 * 1024 * 1024; // 2MB rotation threshold
 
 // ============================================================
-// DEFAULTS
+// DEFAULTS -- lastDailySummary removed
 // ============================================================
 const DEFAULTS = {
-  tagSuffix: "-1",
+  tagSuffix: "-v",
   enablePerformance: false,
   enablePermissions: false,
   enablePermissionAutopilot: false,
-  schedule: "hourly",
+  schedule: "daily",
   dryRun: true,
   nfsSharePath: "/mnt/v0/code/tag-automation",
   stalenessWarnDays: 7,
@@ -80,12 +62,12 @@ const DEFAULTS = {
 // ============================================================
 // PATH HELPERS -- derive all paths from nfsSharePath
 // ============================================================
-function getCsvPath(config)           { return join(config.nfsSharePath, FILE_CURRENT_VMS); }
-function getPreloadPath(config)       { return join(config.nfsSharePath, FILE_PRELOAD_VMS); }
-function getLogPath(config)           { return join(config.nfsSharePath, "logs", FILE_LOG); }
-function getLogBackupPath(config)     { return join(config.nfsSharePath, "logs", FILE_LOG_BACKUP); }
-function getSummaryLogPath(config)    { return join(config.nfsSharePath, "logs", FILE_SUMMARY_LOG); }
-function getDailySummaryPath(config)  { return join(config.nfsSharePath, "logs", FILE_DAILY_SUMMARY); }
+function getCsvPath(config)          { return join(config.nfsSharePath, FILE_CURRENT_VMS); }
+function getPreloadPath(config)      { return join(config.nfsSharePath, FILE_PRELOAD_VMS); }
+function getLogPath(config)          { return join(config.nfsSharePath, "logs", FILE_LOG); }
+function getLogBackupPath(config)    { return join(config.nfsSharePath, "logs", FILE_LOG_BACKUP); }
+function getSummaryLogPath(config)   { return join(config.nfsSharePath, "logs", FILE_SUMMARY_LOG); }
+function getDailySummaryPath(config) { return join(config.nfsSharePath, "logs", FILE_DAILY_SUMMARY); }
 
 // ============================================================
 // NFS FILE LOGGING
@@ -157,6 +139,7 @@ function endRunSummary(results) {
 
 // ============================================================
 // DAILY SUMMARY LOG -- v0.7.6
+// Backend retained fully. UI field removed in v0.7.8.
 // Written once per day at midnight by the midnight scheduler.
 // Tallies total VM count and newly added VMs for that day.
 // Format per line:
@@ -165,12 +148,9 @@ function endRunSummary(results) {
 async function writeDailySummary(config, xo) {
   const dailyPath = getDailySummaryPath(config);
   const date      = new Date().toISOString().slice(0, 10);
-
   try {
-    const allVms    = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
-    const totalVms  = allVms.length;
-
-    // Detect new VMs: VMs not yet in current-vms.csv
+    const allVms   = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
+    const totalVms = allVms.length;
     let newVmNames = [];
     const csvPath  = getCsvPath(config);
     if (existsSync(csvPath)) {
@@ -178,27 +158,22 @@ async function writeDailySummary(config, xo) {
         const raw      = await readFile(csvPath, "utf8");
         const lines    = raw.split("\n").filter(function(l) { return l.trim() && !l.startsWith("#"); });
         const csvUuids = new Set();
-        // Skip header row
         for (let i = 1; i < lines.length; i++) {
           const cols = parseCsvLine(lines[i]);
           if (cols[0]) csvUuids.add(cols[0].trim());
         }
         for (let i = 0; i < allVms.length; i++) {
-          if (!csvUuids.has(allVms[i].uuid)) {
-            newVmNames.push(allVms[i].name_label);
-          }
+          if (!csvUuids.has(allVms[i].uuid)) newVmNames.push(allVms[i].name_label);
         }
       } catch (err) {
         logWarn("Daily summary: could not read " + FILE_CURRENT_VMS + " for new VM detection: " + err.message);
       }
     }
-
-    const newCount  = newVmNames.length;
-    const newNames  = newCount > 0 ? newVmNames.join(", ") : "none";
-    const line      = "[" + date + "] Total VMs: " + totalVms +
-                      " | New VMs today: " + newCount +
-                      " | New VM names: " + newNames;
-
+    const newCount = newVmNames.length;
+    const newNames = newCount > 0 ? newVmNames.join(", ") : "none";
+    const line     = "[" + date + "] Total VMs: " + totalVms +
+                     " | New VMs today: " + newCount +
+                     " | New VM names: " + newNames;
     await mkdir(dirname(dailyPath), { recursive: true });
     await appendFile(dailyPath, line + "\n", "utf8");
     logInfo("Daily summary written -- " + line, true);
@@ -397,7 +372,7 @@ function parseMetaHeader(line) {
   const dateMatch  = line.match(/Updated:\s*(\d{4}-\d{2}-\d{2})/);
   const countMatch = line.match(/VMs:\s*(\d+)/);
   return {
-    date:    dateMatch  ? dateMatch[1]               : null,
+    date:    dateMatch  ? dateMatch[1]                : null,
     vmCount: countMatch ? parseInt(countMatch[1], 10) : null,
   };
 }
@@ -569,9 +544,7 @@ async function enforcePermissions(xo, config) {
     counters.processed++;
     logInfo("VM \"" + liveVm.name_label + "\" -- vm.id=" + liveVm.id + " vm.uuid=" + liveVm.uuid);
     logInfo("  Permission tags: " + permTags.join(", "));
-    for (let j = 0; j < permTags.length; j++) {
-      await applyPermissionTag(xo, permTags[j], liveVm, dryRun, counters);
-    }
+    for (let j = 0; j < permTags.length; j++) { await applyPermissionTag(xo, permTags[j], liveVm, dryRun, counters); }
   }
   logInfo(
     "=== Permission Sync complete -- " + counters.processed + " VMs processed, " +
@@ -584,9 +557,6 @@ async function enforcePermissions(xo, config) {
 // ============================================================
 // PERMISSION AUTOPILOT MODULE -- v0.7.6 SIMPLIFIED
 // Controlled solely by enablePermissionAutopilot toggle.
-// No window, no state file, no date tracking.
-// When enabled: runs enforcePermissionsFromCsv() on every
-// scheduled run AND every Run Now.
 // ============================================================
 async function runPermissionAutopilot(xo, config) {
   if (!config.enablePermissionAutopilot) {
@@ -960,10 +930,9 @@ function getCron(schedule) {
 }
 
 // ============================================================
-// CONFIGURATION SCHEMA -- v0.7.6
-// autopilotWeeks, autopilotStartDate REMOVED.
-// Autopilot controlled solely by enablePermissionAutopilot.
-// New: lastDailySummary read-only display field.
+// CONFIGURATION SCHEMA -- v0.7.8
+// lastDailySummary field REMOVED from UI.
+// All other fields retained from live v0.7.7 GitHub source.
 // ============================================================
 export const configurationSchema = {
   type: "object",
@@ -974,13 +943,13 @@ export const configurationSchema = {
   properties: {
     tagSuffix: {
       type: "string", title: "Tag Suffix",
-      description: "Pool-specific suffix appended to performance tags (e.g. '-1' for POOL-1, '-v' for POOL-V). Leave blank for generic.",
-      default: "-1",
+      description: "Pool-specific suffix , for granular control by pool (e.g. -v for POOL-V, -1 for POOL-1). Leave blank for generic.",
+      default: "-v",
     },
     schedule: {
       type: "string", title: "Enforcement Schedule",
-      description: "How often to automatically run enabled modules (Performance, CSV Sync, Permission Autopilot).",
-      enum: ["hourly", "daily", "disabled"], default: "hourly",
+      description: "How often to run Performance, CSV Sync, and Permission Autopilot.",
+      enum: ["hourly", "daily", "disabled"], default: "daily",
     },
     dryRun: {
       type: "boolean", title: "Dry-Run / Export-CSV",
@@ -992,24 +961,25 @@ export const configurationSchema = {
     },
     enablePerformance: {
       type: "boolean", title: "Enable Performance Sync",
-      description: "Apply CPU weights and IO priorities based on 0-core / 1-high / 2-normal / 3-low tags.",
+      description: "Apply CPU weights and IO priorities based on VM performance tier tags (0-core, 1-high, 2-normal, 3-low).",
       default: false,
     },
     enablePermissions: {
       type: "boolean", title: "Enable Permission Sync",
       description:
-        "Tags ending in -Admin / -Operator / -Viewer trigger group creation and ACL assignments appropriately. " +
+        "Tags ending in -Admin / -Operator / -Viewer trigger group creation and ACL assignments. " +
         "IMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
       default: false,
     },
     enablePermissionAutopilot: {
       type: "boolean", title: "Enable Permission Autopilot",
       description:
-        "CSV-sourced permission enforcement. " +
-        "Reads -Admin / -Operator / -Viewer tags from current-vms.csv (CurrentTags column) and preload-vms.csv (Tags column) only -- does NOT read live VM tags. " +
-        "Runs on set schedule AND via Run Now. " +
-        "Toggle OFF to disable, toggle ON to activate -- no window or timer, runs every cycle while enabled. " +
-        "IMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
+        "Automatically assigns permissions and performance settings using CSV files stored on a secure NFS share. " +
+        "CURRENT-VMS.CSV: Contains existing VMs. To make changes, add performance and/or permission tags to the NewTags column. Changes are applied during the next Autopilot run. " +
+        "PRELOAD-VMS.CSV: Used to predefine settings for VMs being added or migrated to XCP-ng. Autopilot monitors for matching VM names and automatically applies the specified NewTags and Notes when the VM is detected, then adds the VM to current-vms.csv for ongoing management. " +
+        "Example: Set the NewTags value for VM My-VM1 to 2-normal-1;Dept1-Operator. On the next run, Autopilot will set the VM CPU weight to Normal and create (if needed) and assign the Dept1-Operator group with the appropriate VM permissions. " +
+        "IMPORTANT: Verify that your NFS share is properly configured and secured before enabling this feature. " +
+        "If you are not actively performing VM migrations or onboarding projects, Autopilot should be disabled until it is needed again.",
       default: false,
     },
     nfsSharePath: {
@@ -1025,15 +995,6 @@ export const configurationSchema = {
       type: "integer", title: "CSV Age Warning (days)",
       description: "Warn in logs if " + FILE_CURRENT_VMS + " has not been exported in this many days.",
       default: 7,
-    },
-    lastDailySummary: {
-      type: "string", title: "Last Daily Summary (auto-updated at midnight)",
-      description:
-        "Displays the most recent entry from " + FILE_DAILY_SUMMARY + " on your NFS share. " +
-        "Updated automatically at midnight each day. " +
-        "Shows total VM count and newly added VMs for that day. " +
-        "Use the getDailySummary apiMethod via xo-cli to view full history.",
-      default: "(not yet available -- will populate after first midnight run)",
     },
     performanceTiers: {
       type: "object", title: "Performance Tier Settings",
@@ -1086,7 +1047,7 @@ export default function({ xo }) {
     });
     logInfo("Scheduler registered -- cron=" + getCron(_config.schedule));
 
-    // Midnight daily summary job -- runs at 00:00 every day regardless of main schedule
+    // Midnight daily summary job -- always runs at 00:00 regardless of main schedule
     _midnightJob = xo.scheduler.createJob({
       name: "xo-tag-automation-daily-summary",
       cron: "0 0 * * *",
@@ -1123,8 +1084,8 @@ export default function({ xo }) {
     },
 
     unload: async function() {
-      if (_job)         { _job.stop();         _job         = null; logInfo("Scheduler stopped."); }
-      if (_midnightJob) { _midnightJob.stop();  _midnightJob = null; logInfo("Daily summary scheduler stopped."); }
+      if (_job)         { _job.stop();        _job         = null; logInfo("Scheduler stopped."); }
+      if (_midnightJob) { _midnightJob.stop(); _midnightJob = null; logInfo("Daily summary scheduler stopped."); }
     },
 
     test: async function(params) {
@@ -1208,13 +1169,13 @@ export default function({ xo }) {
         catch (err) { throw new Error("Could not read summary log: " + err.message); }
       },
       getDailySummary: async function(params) {
-        const lines       = (params && params.lines) || 30;
-        const dailyPath   = getDailySummaryPath(_config);
+        const lines     = (params && params.lines) || 30;
+        const dailyPath = getDailySummaryPath(_config);
         try {
           if (!existsSync(dailyPath)) return { content: "(no daily summary yet -- will be written at midnight)", path: dailyPath, totalLines: 0, showing: 0 };
-          const content   = await readFile(dailyPath, "utf8");
-          const allLines  = content.split("\n").filter(function(l) { return l.trim(); });
-          const lastLine  = allLines.length > 0 ? allLines[allLines.length - 1] : "(empty)";
+          const content  = await readFile(dailyPath, "utf8");
+          const allLines = content.split("\n").filter(function(l) { return l.trim(); });
+          const lastLine = allLines.length > 0 ? allLines[allLines.length - 1] : "(empty)";
           return { content: allLines.slice(-lines).join("\n"), lastEntry: lastLine, path: dailyPath, totalLines: allLines.length, showing: Math.min(lines, allLines.length) };
         } catch (err) { throw new Error("Could not read daily summary: " + err.message); }
       },
