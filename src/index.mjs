@@ -1,5 +1,5 @@
 // ============================================================
-// xo-server-tag-automation v0.7.8
+// xo-server-tag-automation v0.7.9
 // Tag-Based VM Automation Plugin for Xen Orchestra
 //
 // Changes in v0.7.8:
@@ -967,19 +967,13 @@ export const configurationSchema = {
     enablePermissions: {
       type: "boolean", title: "Enable Permission Sync",
       description:
-        "Tags ending in -Admin / -Operator / -Viewer trigger group creation and ACL assignments. " +
-        "IMPORTANT: Verify your NFS share is properly configured and secured before enabling.",
+        "Tags ending in -Admin / -Operator / -Viewer trigger group creation and ACL assignments when enabled.",
       default: false,
     },
     enablePermissionAutopilot: {
       type: "boolean", title: "Enable Permission Autopilot",
       description:
-        "Automatically assigns permissions and performance settings using CSV files stored on a secure NFS share. " +
-        "CURRENT-VMS.CSV: Contains existing VMs. To make changes, add performance and/or permission tags to the NewTags column. Changes are applied during the next Autopilot run. " +
-        "PRELOAD-VMS.CSV: Used to predefine settings for VMs being added or migrated to XCP-ng. Autopilot monitors for matching VM names and automatically applies the specified NewTags and Notes when the VM is detected, then adds the VM to current-vms.csv for ongoing management. " +
-        "Example: Set the NewTags value for VM My-VM1 to 2-normal-1;Dept1-Operator. On the next run, Autopilot will set the VM CPU weight to Normal and create (if needed) and assign the Dept1-Operator group with the appropriate VM permissions. " +
-        "IMPORTANT: Verify that your NFS share is properly configured and secured before enabling this feature. " +
-        "If you are not actively performing VM migrations or onboarding projects, Autopilot should be disabled until it is needed again.",
+        "Automatically assigns permissions and performance settings on scheduled interval, using CSV files stored on a secure NFS share (See README for more details etc.)  Note: Autopilot should be disabled if your not actively performing VM migrations or onboarding projects.",
       default: false,
     },
     nfsSharePath: {
@@ -988,7 +982,7 @@ export const configurationSchema = {
         "Base path to your NFS share directory. All plugin files are managed here automatically: " +
         FILE_CURRENT_VMS + ", " + FILE_PRELOAD_VMS + ", " +
         "logs/" + FILE_LOG + ", logs/" + FILE_SUMMARY_LOG + ", logs/" + FILE_DAILY_SUMMARY + ". " +
-        "Main log auto-rotates at 2MB (one backup kept as " + FILE_LOG_BACKUP + ").",
+        "Main log auto-rotates at 2MB (one backup kept as " + FILE_LOG_BACKUP + "). " + "IMPORTANT: Verify that your NFS share is properly configured and secured! See README for more details.",
       default: "/mnt/v0/code/tag-automation",
     },
     stalenessWarnDays: {
