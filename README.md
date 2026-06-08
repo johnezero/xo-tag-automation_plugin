@@ -136,11 +136,12 @@ The NFS share hosts your CSV files and logs. Anyone with write access to the sha
   * Do NOT expose the NFS share to the general network or to end-user access.
 
   * Admins who need to edit CSV files can SCP them to/from the XOA:
+
       EXAMPLE:
-      # Download CSV from XOA to your workstation
+      Download CSV from XOA to your workstation
       scp <xoa-user>@<xoa-ip>:/path/to/current-vms.csv ./
 
-      # Upload edited CSV back to XOA
+      Upload edited CSV back to XOA
       scp ./current-vms.csv <xoa-user>@<xoa-ip>:/path/to/current-vms.csv
 
   * Use firewall rules to enforce NFS access at the network level in addition to the exports configuration
