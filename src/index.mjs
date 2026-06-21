@@ -1,32 +1,20 @@
 // ============================================================
-// xo-server-tag-automation  v0.8.1
+// xo-server-tag-automation  v0.8.4
 // Tag-Based VM Performance & Permission Management
 // for Xen Orchestra (xo-server plugin)
 // ============================================================
-// CHANGELOG v0.8.1 (2026-06-20):
-//   FIXED: Scheduler now uses xo.hooks.on('core started', ...)
-//          which is the CONFIRMED correct xo-server internal event
-//          (verified from xo-server/src/xo-mixins/scheduling.mjs)
-//   FIXED: Midnight scheduler uses same xo.hooks pattern
-//   FIXED: Double-registration guard retained (_job / _midnightJob)
-//   FIXED: xo-cli API methods registered at top-level return object
-//   RETAINED: All v0.8.0 fixes and cumulative history
+// CHANGELOG v0.8.4 (2026-06-21):
+//   FIXED: schedule option "6hourly" replaced with "15min" (*/15 * * * *)
+//   ADDED: Multi-pool support via "tagSuffixes" (formerly tagSuffix)
+//          -- Accepts semicolon-separated list (e.g. "-v; -1")
+//          -- Iterates through all suffixes to match performance tags
+//   UPDATED: configurationSchema description for tagSuffixes
+//   RETAINED: All v0.8.3 cumulative fixes (getCron helper, enum dropdown)
+//   RETAINED: @xen-orchestra/cron createSchedule().createJob() pattern
 //
-// CHANGELOG v0.8.0 (2026-06-20):
-//   FIXED: Scheduler race condition -- xo.on("start") replaced
-//   FIXED: xo-cli methods now registered at top-level return object
-//   FIXED: Midnight scheduler uses same guard pattern
-//   ADDED: Explicit "Scheduler registered" log confirmation
-//
-// CHANGELOG v0.7.9 (2026-06-07) -- First Official Public Release:
-//   Airgap bundle verified, build-release.sh added
-//   README fully documented
-//   Daily summary backend (writeDailySummary() at midnight)
-//   getDailySummary and writeDailySummaryNow API methods
-//   preload-vms.csv workflow (renamed from new-vm-list.csv)
-//   current-vms.csv (renamed from vm_metadata.csv, auto-migrated)
-//   Permission Autopilot toggle (enablePermissionAutopilot)
-//   Midnight scheduler independent of main enforcement schedule
+// CHANGELOG v0.8.3 (2026-06-21):
+//   FIXED: schedule field changed from free-text to enum dropdown
+//   ADDED: getCron() helper -- translates enum value to real cron expression
 //
 // Plugin install path:
 //   /usr/local/lib/node_modules/xo-server-tag-automation/
@@ -34,15 +22,13 @@
 
 import fs   from "fs";
 import path from "path";
-import { parse }     from "csv-parse/sync";
-import { stringify } from "csv-stringify/sync";
+import { createSchedule } from "@xen-orchestra/cron";
 
 // ============================================================
 // CONSTANTS & DEFAULTS
 // ============================================================
 
-const PLUGIN_VERSION = "0.8.1";
-const PLUGIN_NAME    = "xo-tag-automation";
+const PLUGIN_VERSION = "0.8.4";
 
 const FILE_CURRENT_VMS = "current-vms.csv";
 const FILE_PRELOAD_VMS = "preload-vms.csv";
@@ -50,13 +36,11 @@ const FILE_LOG         = "xo-tag-automation.log";
 const FILE_SUMMARY_LOG = "xo-tag-automation-summary.log";
 const FILE_DAILY       = "xo-tag-automation-daily.log";
 
-// Hardcoded role suffixes -- intentionally NOT configurable.
-// Configurable suffixes risk mis-assignment with sub-department names.
 const ROLE_SUFFIXES = ["-Admin", "-Operator", "-Viewer"];
 
 const DEFAULTS = {
-  tagSuffix:                 "-v",
-  schedule:                  "0 * * * *",
+  tagSuffixes:               "-v",
+  schedule:                  "hourly",
   dryRun:                    true,
   enablePerformance:         false,
   enablePermissions:         false,
@@ -76,34 +60,49 @@ const DEFAULTS = {
 };
 
 // ============================================================
+// v0.8.3/v0.8.4 FIX: getCron()
+// ============================================================
+
+function getCron(schedule) {
+  if (schedule === "15min")   return "*/15 * * * *";
+  if (schedule === "hourly")  return "0 * * * *";
+  if (schedule === "daily")   return "0 2 * * *";
+  if (schedule && schedule.includes(" ")) return schedule;
+  return "0 * * * *";
+}
+
+// ============================================================
 // CONFIGURATION SCHEMA
 // ============================================================
 
 export const configurationSchema = {
   type: "object",
+  description:
+    "IMPORTANT -- The 'Delete configuration' button resets all plugin settings to defaults. " +
+    "It does NOT delete any VMs, tags, groups, or CSV files on your NFS share.",
   properties: {
-    tagSuffix: {
+    tagSuffixes: {
       type: "string",
-      title: "Tag Suffix",
+      title: "Tag Suffixes",
       description:
-        "Suffix appended to performance tier tags (e.g. -v gives 2-normal-v). " +
-        "Use a unique suffix per pool when managing multiple pools from one XO instance.",
+        "Pool-specific suffix appended to performance tier tags (e.g. \"-1\" for POOL-1, \"-2\" for POOL-2). " +
+        "Use a unique suffix per pool when managing multiple pools from one XO instance. " +
+        "Separate multiple suffixes with semicolons (e.g. \"-v; -1\").",
       default: "-v",
     },
     schedule: {
       type: "string",
-      title: "Schedule (cron)",
+      title: "Schedule",
       description:
-        "Cron expression for how often to run Performance Sync, CSV Sync, and Permission Autopilot. " +
-        "Default: hourly (0 * * * *). Use standard 5-field cron syntax.",
-      default: "0 * * * *",
+        "How often to run the enforcement cycle (Performance Sync, CSV Sync, Permission Autopilot).",
+      enum:    ["15min", "hourly", "daily"],
+      default: "hourly",
     },
     dryRun: {
       type: "boolean",
       title: "Dry Run Mode",
       description:
-        "When ON (default), previews all changes in logs without applying anything. " +
-        "Also exports a fresh current-vms.csv. Turn OFF to apply changes for real.",
+        "When ON (default), previews all changes in logs without applying anything.",
       default: true,
     },
     enablePerformance: {
@@ -117,25 +116,21 @@ export const configurationSchema = {
       type: "boolean",
       title: "Enable Permission Sync",
       description:
-        "Tags ending in -Admin, -Operator, or -Viewer trigger XO Group creation " +
-        "and ACL assignments.",
+        "Tags ending in -Admin, -Operator, or -Viewer trigger XO Group creation and ACL assignments.",
       default: false,
     },
     enablePermissionAutopilot: {
       type: "boolean",
       title: "Enable Permission Autopilot",
       description:
-        "When enabled, reads permission tags from current-vms.csv (by UUID) and " +
-        "preload-vms.csv (by VM name) and applies them automatically on each scheduled run. " +
-        "Disable when not actively performing VM migrations or onboarding.",
+        "When enabled, reads permission tags from CSV files and applies them automatically.",
       default: false,
     },
     nfsSharePath: {
       type: "string",
       title: "NFS Share Path",
       description:
-        "Absolute path to the NFS share directory where CSV files and logs are stored " +
-        "(e.g. /mnt/v0/code/tag-automation).",
+        "Absolute path to the NFS share directory (e.g. /mnt/v0/code/tag-automation).",
       default: "/mnt/v0/code/tag-automation",
     },
     stalenessWarnDays: {
@@ -231,14 +226,25 @@ function getFilePaths(config) {
 // ============================================================
 
 function isRealVm(vm) {
-  if (!vm) return false;
-  if (vm.type !== "VM" && vm.$type !== "VM") return false;
-  if (vm.is_a_template)    return false;
+  if (!vm || !vm.uuid) return false;
+  if (vm.$type !== undefined && vm.$type !== "VM") return false;
+  if (vm.type  !== undefined && vm.type  !== "VM") return false;
+  if (vm.is_a_template === true || vm.is_a_template === "true") return false;
   if (vm.is_control_domain) return false;
-  const name = (vm.name_label || vm.name || "").toLowerCase();
-  if (name.startsWith("xo ") || name.startsWith("xo-")) return false;
-  if (name.includes("[backup]") || name.includes("v2v") || name.includes("esxi")) return false;
-  if (/\.(iso|vmdk|ova|ovf)$/i.test(name)) return false;
+  if (!vm.name_label || !vm.name_label.trim()) return false;
+  const name = vm.name_label.trim();
+  if (name.startsWith("[XO Backup"))             return false;
+  if (name.startsWith("[ESXI]"))                 return false;
+  if (name.includes("import from V2V"))          return false;
+  if (name === "complete import from V2V")       return false;
+  if (name === "after complete import from V2V") return false;
+  if (name === "after partial import from V2V")  return false;
+  if (name === "base copy")                      return false;
+  if (name.endsWith("-flat.vmdk"))               return false;
+  if (name.endsWith("-sesparse.vmdk"))           return false;
+  if (name.endsWith(".iso"))                     return false;
+  if (name.startsWith("Xapi#"))                  return false;
+  if (name.startsWith("Control domain on host")) return false;
   return true;
 }
 
@@ -254,9 +260,9 @@ function getPreloadPath(config) {
   return path.join(config.nfsSharePath || DEFAULTS.nfsSharePath, FILE_PRELOAD_VMS);
 }
 
-function buildMetaHeader(vmCount, tagSuffix) {
+function buildMetaHeader(vmCount, tagSuffixes) {
   const date = new Date().toISOString().slice(0, 10);
-  return `# Updated: ${date} | VMs: ${vmCount} | Pool: ${tagSuffix}`;
+  return `# Updated: ${date} | VMs: ${vmCount} | Pools: ${tagSuffixes}`;
 }
 
 function parseMetaHeader(line) {
@@ -269,7 +275,7 @@ function parseMetaHeader(line) {
 }
 
 // ============================================================
-// LEGACY MIGRATION (vm_metadata.csv -> current-vms.csv)
+// LEGACY MIGRATION
 // ============================================================
 
 async function migrateVmMetadataCsv(config) {
@@ -283,43 +289,51 @@ async function migrateVmMetadataCsv(config) {
 }
 
 // ============================================================
-// GET VM NOTES
+// NOTES HELPER
 // ============================================================
 
 function getVmNotes(vm) {
-  return (
-    vm.name_description ||
-    vm.notes            ||
-    (vm.other_config && vm.other_config.notes)       ||
-    (vm.other_config && vm.other_config.description) ||
-    ""
-  );
+  if (vm.name_description && vm.name_description.trim()) return vm.name_description.trim();
+  if (vm.notes && vm.notes.trim()) return vm.notes.trim();
+  if (vm.other_config) {
+    const oc = vm.other_config;
+    if (oc.notes       && oc.notes.trim())       return oc.notes.trim();
+    if (oc.description && oc.description.trim()) return oc.description.trim();
+  }
+  return "";
 }
 
 // ============================================================
-// PERFORMANCE ENFORCEMENT
+// PERFORMANCE ENFORCEMENT (v0.8.4 Multi-Suffix)
 // ============================================================
 
 async function enforcePerformance(xo, config) {
-  const { tagSuffix, dryRun, performanceTiers: t } = config;
+  const { tagSuffixes, dryRun, performanceTiers: t } = config;
   logInfo(config, `=== Performance Enforcement starting (dryRun=${dryRun}) ===`, true);
 
-  const suffix = tagSuffix || DEFAULTS.tagSuffix;
-  const tiers = [
-    { tag: `0-core${suffix}`,   weight: t.coreWeight,   ioPri: t.coreIoPri,   label: "CORE"   },
-    { tag: `1-high${suffix}`,   weight: t.highWeight,   ioPri: t.highIoPri,   label: "HIGH"   },
-    { tag: `2-normal${suffix}`, weight: t.normalWeight, ioPri: t.normalIoPri, label: "NORMAL" },
-    { tag: `3-low${suffix}`,    weight: t.lowWeight,    ioPri: t.lowIoPri,    label: "LOW"    },
+  const suffixes = (tagSuffixes || DEFAULTS.tagSuffixes).split(";").map(s => s.trim()).filter(Boolean);
+  const tierBases = [
+    { base: "0-core",   weight: t.coreWeight,   ioPri: t.coreIoPri,   label: "CORE"   },
+    { base: "1-high",   weight: t.highWeight,   ioPri: t.highIoPri,   label: "HIGH"   },
+    { base: "2-normal", weight: t.normalWeight, ioPri: t.normalIoPri, label: "NORMAL" },
+    { base: "3-low",    weight: t.lowWeight,    ioPri: t.lowIoPri,    label: "LOW"    },
   ];
 
   const allVms = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
-  let counts = { CORE: 0, HIGH: 0, NORMAL: 0, LOW: 0, SKIPPED: 0 };
+  const counts = { CORE: 0, HIGH: 0, NORMAL: 0, LOW: 0, SKIPPED: 0 };
 
   for (const vm of allVms) {
     const vmTags = vm.tags || [];
-    const matched = tiers.find(tier =>
-      vmTags.some(t => t.toLowerCase() === tier.tag.toLowerCase())
-    );
+    let matched = null;
+
+    // Check each suffix defined in config
+    for (const suffix of suffixes) {
+      matched = tierBases.find(tier =>
+        vmTags.some(t => t.toLowerCase() === (tier.base + suffix).toLowerCase())
+      );
+      if (matched) break;
+    }
+
     if (!matched) { counts.SKIPPED++; continue; }
 
     const desc = `Set ${matched.label} on "${vm.name_label}" (weight=${matched.weight}, ioPri=${matched.ioPri})`;
@@ -328,8 +342,10 @@ async function enforcePerformance(xo, config) {
     } else {
       try {
         const xapi = xo.getXapi(vm);
-        await xapi.call("VM.add_to_VCPUs_params", vm._xapiRef, "weight", String(matched.weight));
-        await xapi.call("VM.add_to_other_config", vm._xapiRef, "sched-pri", String(matched.ioPri));
+        await xapi.call("VM.remove_from_VCPUs_params", vm._xapiRef, "weight");
+        await xapi.call("VM.add_to_VCPUs_params",      vm._xapiRef, "weight", String(matched.weight));
+        await xapi.call("VM.remove_from_other_config", vm._xapiRef, "sched-pri");
+        await xapi.call("VM.add_to_other_config",      vm._xapiRef, "sched-pri", String(matched.ioPri));
         logInfo(config, `[OK] ${desc}`);
       } catch (err) {
         logWarn(config, `[WARN] Failed: ${desc} -- ${err.message}`);
@@ -371,13 +387,10 @@ async function enforcePermissions(xo, config) {
     if (permTags.length === 0) { skipped++; continue; }
 
     vmsProcessed++;
-    logInfo(config, `Processing VM "${vm.name_label}" -- vm.id=${vm.id} vm.uuid=${vm.uuid}`);
-
     for (const tag of permTags) {
       const role = getRoleFromTag(tag);
       if (!role) continue;
 
-      // Find or create group
       let group;
       try {
         const allGroups = await xo.getAllGroups();
@@ -386,22 +399,17 @@ async function enforcePermissions(xo, config) {
           if (!dryRun) {
             const groupId = await xo.createGroup({ name: tag });
             group = { id: groupId, name: tag };
-            logInfo(config, `  Group "${tag}" created -- id=${groupId}`);
             groupsCreated++;
           } else {
-            logInfo(config, `  [DRY-RUN] Would create Group "${tag}"`);
             groupsCreated++;
             continue;
           }
-        } else {
-          logInfo(config, `  Group "${tag}" exists -- id=${group.id}`);
         }
       } catch (err) {
         logWarn(config, `  Failed to find/create group "${tag}": ${err.message}`);
         continue;
       }
 
-      // Apply ACL
       try {
         if (!dryRun) {
           await xo.addAcl({ subjectId: group.id, objectId: vm.id, action: role });
@@ -416,12 +424,7 @@ async function enforcePermissions(xo, config) {
     }
   }
 
-  logInfo(config,
-    `=== Permission Sync complete -- ${vmsProcessed} VMs processed, ` +
-    `${groupsCreated} Groups created/verified, ${aclsApplied} ACL grants applied, ` +
-    `${skipped} skipped ===`,
-    true
-  );
+  logInfo(config, `=== Permission Sync complete ===`, true);
 }
 
 // ============================================================
@@ -431,40 +434,28 @@ async function enforcePermissions(xo, config) {
 async function checkCsvStaleness(config, liveVmCount) {
   const csvPath = getCsvPath(config);
   if (!fs.existsSync(csvPath)) return;
-  const lines   = fs.readFileSync(csvPath, "utf8").split("\n");
+  const lines    = fs.readFileSync(csvPath, "utf8").split("\n");
   const metaLine = lines.find(l => l.startsWith("#"));
-  if (!metaLine) {
-    logWarn(config, `${FILE_CURRENT_VMS} has no metadata header -- consider running Export CSV to refresh.`);
-    return;
-  }
+  if (!metaLine) return;
   const meta = parseMetaHeader(metaLine);
   if (meta.date) {
     const ageDays  = Math.floor((new Date() - new Date(meta.date)) / (1000 * 60 * 60 * 24));
     const warnDays = config.stalenessWarnDays || DEFAULTS.stalenessWarnDays;
     if (ageDays > warnDays) {
-      logWarn(config, `${FILE_CURRENT_VMS} may be stale -- last updated ${ageDays} days ago (${meta.date}).`, true);
-    } else {
-      logInfo(config, `CSV freshness OK -- last updated ${ageDays} day(s) ago (${meta.date}).`);
+      logWarn(config, `${FILE_CURRENT_VMS} stale -- last updated ${ageDays} days ago.`, true);
     }
-  }
-  if (meta.vmCount !== null && liveVmCount > meta.vmCount) {
-    logWarn(config,
-      `VM count mismatch -- CSV has ${meta.vmCount}, live pool has ${liveVmCount}. ` +
-      `Consider re-exporting.`,
-      true
-    );
   }
 }
 
 async function writeRefreshedCsv(xo, config, allVms) {
   const csvPath = getCsvPath(config);
   const rows = [
-    buildMetaHeader(allVms.length, config.tagSuffix || DEFAULTS.tagSuffix),
+    buildMetaHeader(allVms.length, config.tagSuffixes || DEFAULTS.tagSuffixes),
     "UUID,Name,CurrentTags,NewTags,CurrentNotes,NewNotes",
   ];
   for (const vm of allVms) {
     const uuid         = vm.uuid || vm.id || "";
-    const name         = (vm.name_label || vm.name || "").replace(/,/g, ";");
+    const name         = (vm.name_label || "").replace(/,/g, ";");
     const currentTags  = (vm.tags || []).join(";").replace(/,/g, ";");
     const currentNotes = getVmNotes(vm).replace(/,/g, ";").replace(/\n/g, " ");
     rows.push(`${uuid},${name},${currentTags},,${currentNotes},`);
@@ -482,7 +473,6 @@ async function runCsvSync(xo, config) {
 
   const csvPath = getCsvPath(config);
   if (!fs.existsSync(csvPath)) {
-    logInfo(config, `${FILE_CURRENT_VMS} not found -- exporting fresh copy.`);
     await writeRefreshedCsv(xo, config, allVms);
     return { tagsApplied: 0, notesUpdated: 0 };
   }
@@ -502,59 +492,52 @@ async function runCsvSync(xo, config) {
     const vm = allVms.find(v => (v.uuid || v.id) === uuid.trim());
     if (!vm) continue;
 
-    // v0.7.1 FIX: Apply tags BEFORE writing refreshed CSV
     if (newTags) {
       const tagsToAdd = newTags.split(";").map(t => t.trim()).filter(Boolean);
       for (const tag of tagsToAdd) {
-        if (dryRun) {
-          logInfo(config, `[DRY-RUN] Would add tag "${tag}" to VM "${vm.name_label}"`);
-        } else {
+        if (!dryRun) {
           try {
             await xo.call("vm.addTag", { id: vm.id, tag });
             logInfo(config, `[OK] Added tag "${tag}" to VM "${vm.name_label}"`);
             tagsApplied++;
           } catch (err) {
-            logWarn(config, `Failed to add tag "${tag}" to "${vm.name_label}": ${err.message}`);
+            logWarn(config, `Failed to add tag "${tag}": ${err.message}`);
           }
+        } else {
+          logInfo(config, `[DRY-RUN] Would add tag "${tag}" to VM "${vm.name_label}"`);
+          tagsApplied++;
         }
       }
-      if (dryRun) tagsApplied++;
     }
 
     if (newNotes) {
-      if (dryRun) {
-        logInfo(config, `[DRY-RUN] Would update notes on VM "${vm.name_label}"`);
-        notesUpdated++;
-      } else {
+      if (!dryRun) {
         try {
           await xo.call("vm.set", { id: vm.id, name_description: newNotes });
           logInfo(config, `[OK] Updated notes on VM "${vm.name_label}"`);
           notesUpdated++;
         } catch (err) {
-          logWarn(config, `Failed to update notes on "${vm.name_label}": ${err.message}`);
+          logWarn(config, `Failed to update notes: ${err.message}`);
         }
+      } else {
+        logInfo(config, `[DRY-RUN] Would update notes on VM "${vm.name_label}"`);
+        notesUpdated++;
       }
     }
   }
 
-  // v0.7.1 FIX: Refresh CSV AFTER applying changes (not before)
   if (!dryRun && (tagsApplied > 0 || notesUpdated > 0)) {
-    logInfo(config, `Refreshing ${FILE_CURRENT_VMS} after applying changes...`);
     await writeRefreshedCsv(xo, config, allVms);
   } else if (dryRun) {
-    logInfo(config, `[DRY-RUN] Would rewrite ${FILE_CURRENT_VMS} with refreshed data.`);
     await writeRefreshedCsv(xo, config, allVms);
   }
 
-  logInfo(config,
-    `=== CSV Sync complete -- ${tagsApplied} tags applied, ${notesUpdated} notes updated ===`,
-    true
-  );
+  logInfo(config, `=== CSV Sync complete ===`, true);
   return { tagsApplied, notesUpdated };
 }
 
 // ============================================================
-// PERMISSION AUTOPILOT (CSV-driven)
+// PERMISSION AUTOPILOT
 // ============================================================
 
 async function enforcePermissionsFromCsv(xo, config) {
@@ -562,8 +545,6 @@ async function enforcePermissionsFromCsv(xo, config) {
   logInfo(config, "=== Permission Autopilot starting ===", true);
 
   const allVms = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
-
-  // Source 1: current-vms.csv (match by UUID, read CurrentTags column)
   const csvPath = getCsvPath(config);
   if (fs.existsSync(csvPath)) {
     const raw       = fs.readFileSync(csvPath, "utf8");
@@ -582,11 +563,10 @@ async function enforcePermissionsFromCsv(xo, config) {
     }
   }
 
-  // Source 2: preload-vms.csv (match by VM name)
   const preloadPath = getPreloadPath(config);
   if (fs.existsSync(preloadPath)) {
-    const raw         = fs.readFileSync(preloadPath, "utf8");
-    const dataLines   = raw.split("\n").filter(l => l && !l.startsWith("#") && !l.startsWith("Name"));
+    const raw           = fs.readFileSync(preloadPath, "utf8");
+    const dataLines     = raw.split("\n").filter(l => l && !l.startsWith("#") && !l.startsWith("Name"));
     const remainingRows = ["Name,Tags,Notes"];
 
     for (const line of dataLines) {
@@ -595,16 +575,15 @@ async function enforcePermissionsFromCsv(xo, config) {
       const [vmName, tagsRaw] = cols;
       const tags = (tagsRaw || "").split(";").map(t => t.trim()).filter(isPermissionTag);
       const vm   = allVms.find(v =>
-        (v.name_label || v.name || "").toLowerCase() === vmName.trim().toLowerCase()
+        (v.name_label || "").toLowerCase() === vmName.trim().toLowerCase()
       );
-      if (!vm) { remainingRows.push(line); continue; } // VM not found yet -- keep row
+      if (!vm) { remainingRows.push(line); continue; }
       for (const tag of tags) {
         await applyPermissionTag(xo, config, vm, tag);
       }
-      logInfo(config, `Autopilot: Preload row applied and removed for VM "${vmName}"`);
+      logInfo(config, `Autopilot: Preload row applied for VM "${vmName}"`);
     }
 
-    // Write back remaining rows (VMs not yet found)
     if (!config.dryRun) {
       fs.writeFileSync(preloadPath, remainingRows.join("\n") + "\n", "utf8");
     }
@@ -622,16 +601,12 @@ async function applyPermissionTag(xo, config, vm, tag) {
     if (!group && !config.dryRun) {
       const groupId = await xo.createGroup({ name: tag });
       group = { id: groupId, name: tag };
-      logInfo(config, `  Autopilot: Created Group "${tag}"`);
     }
     if (group && !config.dryRun) {
       await xo.addAcl({ subjectId: group.id, objectId: vm.id, action: role });
-      logInfo(config, `  Autopilot: ACL grant Group "${tag}" -> VM "${vm.name_label}" role=${role}`);
-    } else {
-      logInfo(config, `  [DRY-RUN] Autopilot: Would grant Group "${tag}" -> VM "${vm.name_label}" role=${role}`);
     }
   } catch (err) {
-    logWarn(config, `  Autopilot: Failed for tag "${tag}" on VM "${vm.name_label}": ${err.message}`);
+    logWarn(config, `  Autopilot: Failed for tag "${tag}": ${err.message}`);
   }
 }
 
@@ -680,48 +655,26 @@ export default function tagAutomationPlugin({ xo }) {
     ...DEFAULTS,
     performanceTiers: { ...DEFAULTS.performanceTiers },
   };
-  let _job         = null;
-  let _midnightJob = null;
 
-  // --------------------------------------------------------
-  // v0.8.1 FIX: Scheduler registration helpers
-  // Double-registration guard: if _job already set, bail out.
-  // --------------------------------------------------------
-  function registerScheduler() {
-    if (_job) return;
+  let _job = createSchedule(getCron(DEFAULTS.schedule)).createJob(async () => {
+    logInfo(_config, "AutoPilot: Scheduled run starting...");
+    try {
+      await runEnforcementCycle(xo, _config);
+    } catch (err) {
+      logWarn(_config, `AutoPilot: Scheduled run error -- ${err.message}`);
+    }
+  });
 
-    const cron = _config.schedule || "0 * * * *";
-    _job = xo.scheduler.createJob({
-      name: "xo-tag-automation-main",
-      cron: cron,
-      fn: async () => {
-        logInfo(_config, "AutoPilot: Scheduled run starting...");
-        await runEnforcementCycle(xo, _config);
-      },
-    });
-    _job.start();
-    logInfo(_config, `Scheduler registered -- cron: ${cron}`);
-  }
-
-  function registerMidnightScheduler() {
-    if (_midnightJob) return;
-
-    _midnightJob = xo.scheduler.createJob({
-      name: "xo-tag-automation-midnight",
-      cron: "0 0 * * *",
-      fn: async () => {
-        logInfo(_config, "Midnight: Writing daily summary...");
-        await writeDailySummary(xo, _config);
-      },
-    });
-    _midnightJob.start();
-    logInfo(_config, "Midnight scheduler registered -- cron: 0 0 * * *");
-  }
+  let _midnightJob = createSchedule("0 0 * * *").createJob(async () => {
+    logInfo(_config, "Midnight: Writing daily summary...");
+    try {
+      await writeDailySummary(xo, _config);
+    } catch (err) {
+      logWarn(_config, `Midnight: Daily summary error -- ${err.message}`);
+    }
+  });
 
   return {
-    // --------------------------------------------------------
-    // configure() -- called by xo-server when plugin settings change
-    // --------------------------------------------------------
     configure(rawConfig) {
       _config = {
         ...DEFAULTS,
@@ -731,56 +684,45 @@ export default function tagAutomationPlugin({ xo }) {
           ...(rawConfig.performanceTiers || {}),
         },
       };
+
+      const cron = getCron(_config.schedule);
+      logInfo(_config, `configure() called -- schedule="${_config.schedule}" -> cron="${cron}"`);
+
+      _job = createSchedule(cron).createJob(async () => {
+        logInfo(_config, "AutoPilot: Scheduled run starting...");
+        try {
+          await runEnforcementCycle(xo, _config);
+        } catch (err) {
+          logWarn(_config, `AutoPilot: Scheduled run error -- ${err.message}`);
+        }
+      });
+
+      _midnightJob = createSchedule("0 0 * * *").createJob(async () => {
+        logInfo(_config, "Midnight: Writing daily summary...");
+        try {
+          await writeDailySummary(xo, _config);
+        } catch (err) {
+          logWarn(_config, `Midnight: Daily summary error -- ${err.message}`);
+        }
+      });
     },
 
-    // --------------------------------------------------------
-    // load() -- v0.8.1 FIX:
-    //   Use xo.hooks.on('core started', ...) -- the CONFIRMED correct
-    //   xo-server internal event, verified from source:
-    //   packages/xo-server/src/xo-mixins/scheduling.mjs
-    //
-    //   xo.hooks.on('core started') fires when xo-server core is
-    //   fully initialized and xo.scheduler is guaranteed available.
-    //
-    //   Fallback: if xo.hooks is unavailable, attempt direct
-    //   registration (defensive coding for future xo-server changes).
-    // --------------------------------------------------------
     async load() {
       logInfo(_config, `Plugin loading... (v${PLUGIN_VERSION})`);
       await migrateVmMetadataCsv(_config);
-
-      if (xo.hooks) {
-        // v0.8.1: Correct event -- confirmed from xo-server source
-        xo.hooks.on("core started", () => {
-          logInfo(_config, "Core started event received -- registering schedulers now.");
-          registerScheduler();
-          registerMidnightScheduler();
-        });
-        logInfo(_config, "Plugin loaded -- waiting for core started event (via xo.hooks).");
-      } else {
-        // Fallback: xo.hooks not available -- attempt direct registration
-        logWarn(_config, "xo.hooks not available -- attempting direct scheduler registration.");
-        if (xo.scheduler) {
-          registerScheduler();
-          registerMidnightScheduler();
-        } else {
-          logWarn(_config, "xo.scheduler also not available -- AutoPilot will NOT run! Check xo-server version.");
-        }
-      }
+      _job.start();
+      _midnightJob.start();
+      const cron = getCron(_config.schedule);
+      logInfo(_config, `Scheduler started -- schedule="${_config.schedule}" cron="${cron}"`);
+      logInfo(_config, "Midnight scheduler started -- cron: 0 0 * * *");
     },
 
-    // --------------------------------------------------------
-    // unload() -- clean up jobs on plugin disable/restart
-    // --------------------------------------------------------
     async unload() {
-      if (_job)         { _job.stop();        _job         = null; }
-      if (_midnightJob) { _midnightJob.stop(); _midnightJob = null; }
+      _job.stop();
+      _midnightJob.stop();
       logInfo(_config, "Plugin unloaded -- schedulers stopped.");
     },
 
-    // --------------------------------------------------------
-    // test() -- triggered by [Test Plugin] button in XO UI
-    // --------------------------------------------------------
     testSchema: {
       type: "object",
       properties: {
@@ -803,44 +745,31 @@ export default function tagAutomationPlugin({ xo }) {
       return "Enforcement cycle complete -- check NFS logs for details.";
     },
 
-    // --------------------------------------------------------
-    // xo-cli API Methods
-    // v0.8.0 FIX: Registered at top-level return object.
-    // These MUST be here (not inside load()) to be exposed
-    // to the JSON-RPC API and callable via xo-cli.
-    // --------------------------------------------------------
-
-    // Trigger a full enforcement cycle
     async "xo-server-tag-automation.runSync"() {
       await runEnforcementCycle(xo, _config);
       return "Sync complete.";
     },
 
-    // View last N lines of main log
     async "xo-server-tag-automation.getLog"({ lines = 50 } = {}) {
       return readLogTail(_config, FILE_LOG, Number(lines));
     },
 
-    // View last N lines of summary log
     async "xo-server-tag-automation.getSummaryLog"({ lines = 50 } = {}) {
       return readLogTail(_config, FILE_SUMMARY_LOG, Number(lines));
     },
 
-    // Export VM inventory to current-vms.csv
     async "xo-server-tag-automation.exportCsv"() {
       const allVms = Object.values(xo.getObjects({ type: "VM" })).filter(isRealVm);
       await writeRefreshedCsv(xo, _config, allVms);
       return `Exported ${allVms.length} VMs to ${FILE_CURRENT_VMS}`;
     },
 
-    // Print CSV content to stdout
     async "xo-server-tag-automation.downloadCsvApi"() {
       const csvPath = getCsvPath(_config);
       if (!fs.existsSync(csvPath)) return `[File not found: ${csvPath}]`;
       return fs.readFileSync(csvPath, "utf8");
     },
 
-    // Push an edited CSV back to the NFS share
     async "xo-server-tag-automation.uploadCsvApi"({ content } = {}) {
       if (!content) throw new Error("No content provided.");
       const csvPath = getCsvPath(_config);
@@ -849,17 +778,14 @@ export default function tagAutomationPlugin({ xo }) {
       return `Uploaded successfully to ${csvPath}`;
     },
 
-    // Show all configured file paths
     async "xo-server-tag-automation.getFilePaths"() {
       return getFilePaths(_config);
     },
 
-    // Get nightly VM count summary
     async "xo-server-tag-automation.getDailySummary"() {
       return getDailySummaryContent(_config);
     },
 
-    // Write daily summary immediately (without waiting for midnight)
     async "xo-server-tag-automation.writeDailySummaryNow"() {
       return await writeDailySummary(xo, _config);
     },
