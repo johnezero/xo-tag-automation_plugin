@@ -45,8 +45,6 @@ Applies CPU weights and IO priorities (`sched-pri`) based on VM performance tier
 | `2-normal` | 512 | 5 |
 | `3-low` | 256 | 2 |
 
-A configurable **tag suffix** (e.g. `-v`, `-1`) allows multi-pool management from a single XO instance without tag collisions.
-
 ### Permission Sync
 
 VM tags ending in `-Admin`, `-Operator`, or `-Viewer` automatically trigger XO Group creation and ACL assignments. No manual group management required.
