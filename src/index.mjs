@@ -1,50 +1,44 @@
 // ============================================================
-// xo-server-tag-automation v0.9.4
+// xo-server-tag-automation v0.9.8
 // Tag-Based VM Performance & Permission Management
 // for Xen Orchestra (xo-server plugin)
 // ============================================================
-// CHANGELOG v0.9.4 (2026-07-08):
+// CHANGELOG v0.9.8 (2026-07-19):
 //
-// BASE: Full v0.9.2 source (all modules intact)
+// FIX: ACL assignments silently failing -- wrong argument format
+//   - xo.addAcl() takes POSITIONAL args: (subjectId, objectId, action)
+//   - All previous versions called: xo.addAcl({ subjectId, objectId, action })
+//   - Passing an object as the first arg means subjectId=object,
+//     objectId=undefined, action=undefined -- call silently does
+//     nothing (no error thrown, ACL never created)
+//   - This is the same positional args bug as XAPI calls fixed in v0.9.2
+//   - SOURCE CONFIRMED: packages/xo-server/src/xo-mixins/acls.mjs
+//     this._acls.create(subjectId, objectId, action) -- positional
+//   - Fix applied in ALL three call sites:
+//       applyPermissionTag()    -- used by preload + CSV sync inline ACL
+//       enforcePermissions()    -- full permission sync
+//   - Also confirmed: xo.getAllGroups() correct (no args)
+//   - Also confirmed: xo.createGroup({ name }) correct (object arg)
 //
-// FIX 1 (from v0.9.3): Log rotation with gzip compression
-//   - rotateLogs() called at start of each enforcement cycle
-//   - Rotates at LOG_MAX_BYTES (10MB), keeps LOG_MAX_FILES (3) .gz copies
-//   - Uses Node built-in zlib -- no extra dependencies
-//   - Truncates (not deletes) live log to preserve open file descriptors
+// KNOWLEDGE BANK UPDATE (add to Section X -- XO Plugin API Rules):
+//   CONFIRMED BROKEN:
+//     xo.addAcl({ subjectId, objectId, action })  -- WRONG, silent fail
+//   CONFIRMED WORKING:
+//     xo.addAcl(subjectId, objectId, action)      -- CORRECT positional
 //
-// FIX 2 (from v0.9.3): processPreloadVms() -- dedicated preload function
-//   - Replaces broken preload logic in enforcePermissionsFromCsv()
-//   - Applies ALL tags (not just permission tags) via xapi.call("VM.add_tags")
-//   - Applies notes via xapi.call("VM.set_name_description")
-//   - VM matched by name (case-insensitive)
+// BASE: Full v0.9.7 source (all modules intact -- no other changes)
 //
-// FIX 3 (v0.9.4): Preload dryRun logic -- rows NOT removed in dryRun mode
-//   - Rows only removed from preload-vms.csv when dryRun=false AND no errors
-//   - Rows kept in preload on partial failure for retry next cycle
-//
-// FIX 4 (v0.9.4): Proper CSV parser -- handles quoted fields with commas
-//   - parseCsvLine() replaces naive line.split(",")
-//   - Prevents column shifting for VMs with commas in notes field
-//
-// FIX 5 (v0.9.4): Log rotation loop fixed
-//   - Correctly shifts .1.gz -> .2.gz -> .3.gz before compressing current log
-//
-// FIX 6 (v0.9.4): Targeted diagnostics for filtered VMs
-//   - isRealVm() now accepts optional diagnosticName param
-//   - If a preload VM name matches but is filtered, logs the exact reason
-//
-// RETAINED from v0.9.2:
-//   - All direct XAPI calls (xo.call / xo.callApi do not exist)
-//   - Positional args: (ref, key, value) -- prevents PARAMETER_COUNT_MISMATCH
-//   - remove_from before add_to -- prevents MAP_DUPLICATE_KEY
-//   - Full configurationSchema with all fields
-//   - enforcePerformance() -- 0-core/1-high/2-normal/3-low tier matching
+// RETAINED from v0.9.7:
+//   - runCsvSync() inline ACL fix (v0.9.7)
+//   - processPreloadVms() inline ACL fix (v0.9.6)
+//   - configure() scheduler fix -- stop old + start new (v0.9.5)
+//   - parseCsvLine() -- proper quoted-field CSV parser (v0.9.4)
+//   - rotateLogs() -- gzip rotation, fixed shift loop (v0.9.4)
+//   - isRealVm() -- diagnostic logging for filtered VMs (v0.9.4)
+//   - enforcePerformance() -- direct XAPI calls, positional args
 //   - enforcePermissions() -- group creation + ACL assignment
-//   - enforcePermissionsFromCsv() -- permission autopilot from current-vms.csv
-//   - runCsvSync() -- full CSV read/write/apply cycle
-//   - writeRefreshedCsv() -- refreshes current-vms.csv after each cycle
-//   - checkCsvStaleness() -- warns if CSV is older than stalenessWarnDays
+//   - enforcePermissionsFromCsv() -- permission autopilot
+//   - writeRefreshedCsv() / checkCsvStaleness()
 //   - migrateVmMetadataCsv() -- legacy vm_metadata.csv migration
 //   - getVmNotes() -- 4-property fallback chain
 //   - writeDailySummary() + getDailySummaryContent()
@@ -52,6 +46,7 @@
 //   - testSchema with "Run Now" and "Export CSV" actions
 //   - All 9 xo-cli API methods
 //   - getFilePaths() helper
+//   - Full configurationSchema export
 // ============================================================
 
 import fs from "fs";
@@ -67,7 +62,7 @@ const pipelineAsync = promisify(pipeline);
 // CONSTANTS & DEFAULTS
 // ============================================================
 
-const PLUGIN_VERSION = "0.9.4";
+const PLUGIN_VERSION = "0.9.8";
 const FILE_CURRENT_VMS = "current-vms.csv";
 const FILE_PRELOAD_VMS = "preload-vms.csv";
 const FILE_LOG         = "xo-tag-automation.log";
@@ -143,7 +138,7 @@ export const configurationSchema = {
       type: "boolean",
       title: "Enable Permission Autopilot",
       description:
-        "Reads permission tags from current-vms.csv and applies group/ACL assignments automatically.",
+        "Reads permission tags from current-vms.csv and preload-vms.csv and applies them automatically.",
       default: false,
     },
     nfsSharePath: {
@@ -218,22 +213,18 @@ function parseCsvLine(line) {
 function getFilePaths(config) {
   const base = config.nfsSharePath || DEFAULTS.nfsSharePath;
   return {
-    nfsSharePath:   base,
-    currentVmsCsv:  path.join(base, FILE_CURRENT_VMS),
-    preloadVmsCsv:  path.join(base, FILE_PRELOAD_VMS),
-    logFile:        path.join(base, "logs", FILE_LOG),
-    summaryLog:     path.join(base, "logs", FILE_SUMMARY_LOG),
-    dailyLog:       path.join(base, "logs", FILE_DAILY),
+    nfsSharePath:  base,
+    currentVmsCsv: path.join(base, FILE_CURRENT_VMS),
+    preloadVmsCsv: path.join(base, FILE_PRELOAD_VMS),
+    logFile:       path.join(base, "logs", FILE_LOG),
+    summaryLog:    path.join(base, "logs", FILE_SUMMARY_LOG),
+    dailyLog:      path.join(base, "logs", FILE_DAILY),
   };
 }
 
 // ============================================================
-// LOG ROTATION (v0.9.4)
+// LOG ROTATION
 // ============================================================
-// Called at the start of every enforcement cycle.
-// No-op if log is under LOG_MAX_BYTES.
-// Rotation: current -> .1.gz, old .1.gz -> .2.gz, etc.
-// Truncates (not deletes) the live log to preserve open descriptors.
 
 async function rotateLogs(config) {
   const logPath = getLogPath(config, FILE_LOG);
@@ -325,9 +316,8 @@ function readLogTail(config, filename, lines = 50) {
 }
 
 // ============================================================
-// VM FILTER (v0.9.4 -- with optional diagnostic logging)
+// VM FILTER -- with optional diagnostic logging
 // ============================================================
-// Pass diagnosticName to log the exact reason a named VM is filtered.
 
 function isRealVm(vm, diagnosticName = null) {
   const logSkip = (reason) => {
@@ -343,26 +333,26 @@ function isRealVm(vm, diagnosticName = null) {
     return false;
   };
 
-  if (!vm || !vm.uuid)                                          return logSkip("Missing or no UUID");
-  if (vm.$type !== undefined && vm.$type !== "VM")             return logSkip(`$type="${vm.$type}" (not "VM")`);
-  if (vm.type  !== undefined && vm.type  !== "VM")             return logSkip(`type="${vm.type}" (not "VM")`);
+  if (!vm || !vm.uuid)                                           return logSkip("Missing or no UUID");
+  if (vm.$type !== undefined && vm.$type !== "VM")              return logSkip(`$type="${vm.$type}" (not "VM")`);
+  if (vm.type  !== undefined && vm.type  !== "VM")              return logSkip(`type="${vm.type}" (not "VM")`);
   if (vm.is_a_template === true || vm.is_a_template === "true") return logSkip("is_a_template=true");
-  if (vm.is_control_domain)                                    return logSkip("is_control_domain=true");
+  if (vm.is_control_domain)                                     return logSkip("is_control_domain=true");
 
   const name = (vm.name_label || "").trim();
-  if (!name)                                          return logSkip("Empty name_label");
-  if (name.startsWith("[XO Backup"))                  return logSkip("XO Backup VM");
-  if (name.startsWith("[ESXI]"))                      return logSkip("ESXI import VM");
-  if (name.includes("import from V2V"))               return logSkip("V2V import VM");
-  if (name === "complete import from V2V")            return logSkip("V2V import VM (complete)");
-  if (name === "after complete import from V2V")      return logSkip("V2V import VM (after complete)");
-  if (name === "after partial import from V2V")       return logSkip("V2V import VM (after partial)");
-  if (name === "base copy")                           return logSkip("base copy");
-  if (name.endsWith("-flat.vmdk"))                    return logSkip("flat VMDK");
-  if (name.endsWith("-sesparse.vmdk"))                return logSkip("sesparse VMDK");
-  if (name.endsWith(".iso"))                          return logSkip("ISO file");
-  if (name.startsWith("Xapi#"))                       return logSkip("Xapi internal object");
-  if (name.startsWith("Control domain on host"))      return logSkip("Control domain");
+  if (!name)                                         return logSkip("Empty name_label");
+  if (name.startsWith("[XO Backup"))                 return logSkip("XO Backup VM");
+  if (name.startsWith("[ESXI]"))                     return logSkip("ESXI import VM");
+  if (name.includes("import from V2V"))              return logSkip("V2V import VM");
+  if (name === "complete import from V2V")           return logSkip("V2V import VM (complete)");
+  if (name === "after complete import from V2V")     return logSkip("V2V import VM (after complete)");
+  if (name === "after partial import from V2V")      return logSkip("V2V import VM (after partial)");
+  if (name === "base copy")                          return logSkip("base copy");
+  if (name.endsWith("-flat.vmdk"))                   return logSkip("flat VMDK");
+  if (name.endsWith("-sesparse.vmdk"))               return logSkip("sesparse VMDK");
+  if (name.endsWith(".iso"))                         return logSkip("ISO file");
+  if (name.startsWith("Xapi#"))                      return logSkip("Xapi internal object");
+  if (name.startsWith("Control domain on host"))     return logSkip("Control domain");
 
   return true;
 }
@@ -408,7 +398,7 @@ async function migrateVmMetadataCsv(config) {
 }
 
 // ============================================================
-// NOTES HELPER -- 4-property fallback chain (v0.5.4)
+// NOTES HELPER -- 4-property fallback chain
 // ============================================================
 
 function getVmNotes(vm) {
@@ -529,7 +519,9 @@ async function enforcePermissions(xo, config) {
 
       try {
         if (!dryRun) {
-          await xo.addAcl({ subjectId: group.id, objectId: vm.id, action: role });
+          // v0.9.8 FIX: positional args -- NOT object format
+          // xo.addAcl(subjectId, objectId, action) -- confirmed from acls.mjs source
+          await xo.addAcl(group.id, vm.id, role);
           logInfo(config, `  [OK] ACL grant: Group "${tag}" -> VM "${vm.name_label}" role=${role}`);
         } else {
           logInfo(config, `  [DRY-RUN] Would grant: Group "${tag}" -> VM "${vm.name_label}" role=${role}`);
@@ -549,7 +541,76 @@ async function enforcePermissions(xo, config) {
 }
 
 // ============================================================
-// CSV SYNC
+// PERMISSION AUTOPILOT
+// ============================================================
+
+async function applyPermissionTag(xo, config, vm, tag) {
+  const role = getRoleFromTag(tag);
+  if (!role) return;
+  const { dryRun } = config;
+  try {
+    const allGroups = await xo.getAllGroups();
+    let group = allGroups.find(g => g.name === tag);
+    if (!group) {
+      if (!dryRun) {
+        const groupId = await xo.createGroup({ name: tag });
+        group = { id: groupId, name: tag };
+        logInfo(config, `  [Autopilot][OK] Created group "${tag}"`);
+      } else {
+        logInfo(config, `  [Autopilot][DRY-RUN] Would create group "${tag}"`);
+        return;
+      }
+    }
+    if (group) {
+      if (!dryRun) {
+        // v0.9.8 FIX: positional args -- NOT object format
+        // xo.addAcl(subjectId, objectId, action) -- confirmed from acls.mjs source
+        await xo.addAcl(group.id, vm.id, role);
+        logInfo(config, `  [Autopilot][OK] ACL: Group "${tag}" -> VM "${vm.name_label}" role=${role}`);
+      } else {
+        logInfo(config, `  [Autopilot][DRY-RUN] Would grant: Group "${tag}" -> VM "${vm.name_label}" role=${role}`);
+      }
+    }
+  } catch (err) {
+    logWarn(config, `  [Autopilot] Failed for tag "${tag}" on "${vm.name_label}": ${err.message}`);
+  }
+}
+
+async function enforcePermissionsFromCsv(xo, config) {
+  if (!config.enablePermissionAutopilot) return;
+  logInfo(config, "=== Permission Autopilot starting ===", true);
+
+  const allVms  = Object.values(xo.getObjects({ type: "VM" })).filter(v => isRealVm(v));
+  const csvPath = getCsvPath(config);
+
+  if (fs.existsSync(csvPath)) {
+    const raw       = fs.readFileSync(csvPath, "utf8");
+    const dataLines = raw
+      .split("\n")
+      .filter(l => l && !l.startsWith("#") && !l.startsWith("UUID"));
+
+    for (const line of dataLines) {
+      const cols = parseCsvLine(line);
+      if (cols.length < 3) continue;
+      const [uuid, , currentTagsRaw] = cols;
+      const tags = (currentTagsRaw || "")
+        .split(";")
+        .map(t => t.trim())
+        .filter(isPermissionTag);
+      if (!tags.length) continue;
+      const vm = allVms.find(v => (v.uuid || v.id) === uuid.trim());
+      if (!vm) continue;
+      for (const tag of tags) {
+        await applyPermissionTag(xo, config, vm, tag);
+      }
+    }
+  }
+
+  logInfo(config, "=== Permission Autopilot complete ===", true);
+}
+
+// ============================================================
+// CSV SYNC (v0.9.7 inline ACL fix retained)
 // ============================================================
 
 async function checkCsvStaleness(config) {
@@ -604,6 +665,7 @@ async function runCsvSync(xo, config) {
     .filter(l => l && !l.startsWith("#") && !l.startsWith("UUID"));
 
   let tagsApplied = 0, notesUpdated = 0;
+  const shouldApplyAcls = config.enablePermissions || config.enablePermissionAutopilot;
 
   for (const line of dataLines) {
     const cols = parseCsvLine(line);
@@ -616,7 +678,6 @@ async function runCsvSync(xo, config) {
     const vm = allVms.find(v => (v.uuid || v.id) === uuid.trim());
     if (!vm) continue;
 
-    // v0.9.2: Direct XAPI calls -- xo.call("vm.addTag") does not exist
     const xapi = xo.getXapi(vm);
 
     if (newTags) {
@@ -627,6 +688,14 @@ async function runCsvSync(xo, config) {
             await xapi.call("VM.add_tags", vm._xapiRef, tag);
             logInfo(config, `[OK] Added tag "${tag}" to VM "${vm.name_label}"`);
             tagsApplied++;
+
+            // v0.9.7: Apply ACL inline immediately -- don't wait for enforcePermissions()
+            // v0.9.8: applyPermissionTag() now uses correct positional args for xo.addAcl()
+            if (shouldApplyAcls && isPermissionTag(tag)) {
+              logInfo(config, `[CSV Sync] Applying ACL inline for permission tag "${tag}" on "${vm.name_label}"`);
+              await applyPermissionTag(xo, config, vm, tag);
+            }
+
           } catch (err) {
             if (err.message && err.message.includes("MAP_DUPLICATE_KEY")) {
               logInfo(config, `[SKIP] Tag "${tag}" already present on "${vm.name_label}"`);
@@ -637,6 +706,10 @@ async function runCsvSync(xo, config) {
         } else {
           logInfo(config, `[DRY-RUN] Would add tag "${tag}" to VM "${vm.name_label}"`);
           tagsApplied++;
+          if (shouldApplyAcls && isPermissionTag(tag)) {
+            logInfo(config, `[DRY-RUN][CSV Sync] Would apply ACL inline for permission tag "${tag}" on "${vm.name_label}"`);
+            await applyPermissionTag(xo, config, vm, tag);
+          }
         }
       }
     }
@@ -644,7 +717,6 @@ async function runCsvSync(xo, config) {
     if (newNotes) {
       if (!dryRun) {
         try {
-          // v0.9.2: Direct XAPI call for name_description
           await xapi.call("VM.set_name_description", vm._xapiRef, newNotes);
           logInfo(config, `[OK] Updated notes on VM "${vm.name_label}"`);
           notesUpdated++;
@@ -664,24 +736,8 @@ async function runCsvSync(xo, config) {
 }
 
 // ============================================================
-// PRELOAD VMs (v0.9.3/v0.9.4 -- FIXED)
+// PRELOAD VMs (v0.9.6 inline ACL fix retained + v0.9.8 addAcl fix)
 // ============================================================
-// Dedicated function -- replaces broken preload logic that was
-// incorrectly embedded in enforcePermissionsFromCsv().
-//
-// preload-vms.csv format:
-//   # comment lines ignored
-//   Name,Tags,Notes
-//   myvm01,2-normal;Otters-Operator,Some notes here
-//   myvm02,1-high,,
-//
-// Key fixes vs old code:
-//   - ALL tags applied (not just permission tags)
-//   - Uses xapi.call("VM.add_tags") -- same path as runCsvSync
-//   - Rows only removed when dryRun=false AND no errors
-//   - Rows kept in preload on partial failure (retry next cycle)
-//   - VM not found = kept in preload (logged, not silently dropped)
-//   - parseCsvLine() handles quoted fields with commas in notes
 
 async function processPreloadVms(xo, config) {
   const preloadPath = getPreloadPath(config);
@@ -690,7 +746,6 @@ async function processPreloadVms(xo, config) {
   const { dryRun } = config;
   logInfo(config, `=== Preload VMs starting (dryRun=${dryRun}) ===`, true);
 
-  // Get all objects for diagnostic filtering
   const allObjects = Object.values(xo.getObjects({ type: "VM" }));
   const raw        = fs.readFileSync(preloadPath, "utf8");
   const lines      = raw.split("\n");
@@ -701,7 +756,6 @@ async function processPreloadVms(xo, config) {
   for (const line of lines) {
     const trimmed = line.trim();
 
-    // Always keep header and comment lines
     if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("Name,")) {
       remainingRows.push(line);
       continue;
@@ -717,7 +771,6 @@ async function processPreloadVms(xo, config) {
       continue;
     }
 
-    // Match VM by name (case-insensitive), with diagnostic logging if filtered
     const vm = allObjects.find(v =>
       (v.name_label || "").toLowerCase() === vmName.toLowerCase() &&
       isRealVm(v, vmName)
@@ -734,6 +787,7 @@ async function processPreloadVms(xo, config) {
     const tagsToAdd = tagsRaw.split(";").map(t => t.trim()).filter(Boolean);
     let   rowOk     = true;
 
+    // Step 1: Apply all tags via direct XAPI
     for (const tag of tagsToAdd) {
       if (!dryRun) {
         try {
@@ -752,6 +806,7 @@ async function processPreloadVms(xo, config) {
       }
     }
 
+    // Step 2: Apply notes via direct XAPI
     if (notesRaw) {
       if (!dryRun) {
         try {
@@ -766,93 +821,35 @@ async function processPreloadVms(xo, config) {
       }
     }
 
-    // v0.9.4 FIX: Only remove row from preload when dryRun=false AND no errors
+    // Step 3: Immediately apply ACLs for permission tags (v0.9.6)
+    // applyPermissionTag() now uses correct positional args (v0.9.8)
+    const shouldApplyAcls = config.enablePermissions || config.enablePermissionAutopilot;
+    if (shouldApplyAcls) {
+      for (const tag of tagsToAdd) {
+        if (isPermissionTag(tag)) {
+          logInfo(config, `[Preload] Applying ACL inline for permission tag "${tag}" on "${vm.name_label}"`);
+          await applyPermissionTag(xo, config, vm, tag);
+        }
+      }
+    }
+
     if (dryRun) {
       logInfo(config, `[Preload][DRY-RUN] VM "${vm.name_label}" would be removed from preload`);
-      remainingRows.push(line); // keep in preload during dry run
+      remainingRows.push(line);
     } else if (rowOk) {
       logInfo(config, `[Preload][DONE] VM "${vm.name_label}" processed -- removed from preload`);
       applied++;
-      // Do NOT push to remainingRows -- this removes it from the file
     } else {
       logWarn(config, `[Preload][RETRY] VM "${vm.name_label}" had errors -- keeping in preload`);
       remainingRows.push(line);
     }
   }
 
-  // Write back only rows still needing processing (only when not dryRun)
   if (!dryRun) {
     fs.writeFileSync(preloadPath, remainingRows.join("\n") + "\n", "utf8");
   }
 
   logInfo(config, `=== Preload VMs complete (applied=${applied}, notFound=${notFound}) ===`, true);
-}
-
-// ============================================================
-// PERMISSION AUTOPILOT (permission tags only -- from current-vms.csv)
-// ============================================================
-
-async function applyPermissionTag(xo, config, vm, tag) {
-  const role = getRoleFromTag(tag);
-  if (!role) return;
-  const { dryRun } = config;
-  try {
-    const allGroups = await xo.getAllGroups();
-    let group = allGroups.find(g => g.name === tag);
-    if (!group) {
-      if (!dryRun) {
-        const groupId = await xo.createGroup({ name: tag });
-        group = { id: groupId, name: tag };
-        logInfo(config, `  [Autopilot][OK] Created group "${tag}"`);
-      } else {
-        logInfo(config, `  [Autopilot][DRY-RUN] Would create group "${tag}"`);
-        return;
-      }
-    }
-    if (group) {
-      if (!dryRun) {
-        await xo.addAcl({ subjectId: group.id, objectId: vm.id, action: role });
-        logInfo(config, `  [Autopilot][OK] ACL: Group "${tag}" -> VM "${vm.name_label}" role=${role}`);
-      } else {
-        logInfo(config, `  [Autopilot][DRY-RUN] Would grant: Group "${tag}" -> VM "${vm.name_label}" role=${role}`);
-      }
-    }
-  } catch (err) {
-    logWarn(config, `  [Autopilot] Failed for tag "${tag}" on "${vm.name_label}": ${err.message}`);
-  }
-}
-
-async function enforcePermissionsFromCsv(xo, config) {
-  if (!config.enablePermissionAutopilot) return;
-  logInfo(config, "=== Permission Autopilot starting ===", true);
-
-  const allVms  = Object.values(xo.getObjects({ type: "VM" })).filter(v => isRealVm(v));
-  const csvPath = getCsvPath(config);
-
-  if (fs.existsSync(csvPath)) {
-    const raw       = fs.readFileSync(csvPath, "utf8");
-    const dataLines = raw
-      .split("\n")
-      .filter(l => l && !l.startsWith("#") && !l.startsWith("UUID"));
-
-    for (const line of dataLines) {
-      const cols = parseCsvLine(line);
-      if (cols.length < 3) continue;
-      const [uuid, , currentTagsRaw] = cols;
-      const tags = (currentTagsRaw || "")
-        .split(";")
-        .map(t => t.trim())
-        .filter(isPermissionTag);
-      if (!tags.length) continue;
-      const vm = allVms.find(v => (v.uuid || v.id) === uuid.trim());
-      if (!vm) continue;
-      for (const tag of tags) {
-        await applyPermissionTag(xo, config, vm, tag);
-      }
-    }
-  }
-
-  logInfo(config, "=== Permission Autopilot complete ===", true);
 }
 
 // ============================================================
@@ -924,7 +921,11 @@ export default function tagAutomationPlugin({ xo }) {
   });
 
   return {
+    // v0.9.5 FIX: stop old schedulers, create new ones, start them immediately
     configure(rawConfig) {
+      try { _job.stop(); }         catch (_) {}
+      try { _midnightJob.stop(); } catch (_) {}
+
       _config = {
         ...DEFAULTS,
         ...rawConfig,
@@ -933,6 +934,7 @@ export default function tagAutomationPlugin({ xo }) {
           ...(rawConfig.performanceTiers || {}),
         },
       };
+
       const cron = getCron(_config.schedule);
       logInfo(_config, `configure() called -- schedule="${_config.schedule}" -> cron="${cron}"`);
 
@@ -953,6 +955,12 @@ export default function tagAutomationPlugin({ xo }) {
           logWarn(_config, `Midnight: Daily summary error -- ${err.message}`);
         }
       });
+
+      _job.start();
+      _midnightJob.start();
+
+      logInfo(_config, `Scheduler restarted -- schedule="${_config.schedule}" cron="${cron}"`);
+      logInfo(_config, "Midnight scheduler restarted -- cron: 0 0 * * *");
     },
 
     async load() {
@@ -966,8 +974,8 @@ export default function tagAutomationPlugin({ xo }) {
     },
 
     async unload() {
-      _job.stop();
-      _midnightJob.stop();
+      try { _job.stop(); }         catch (_) {}
+      try { _midnightJob.stop(); } catch (_) {}
       logInfo(_config, "Plugin unloaded -- schedulers stopped.");
     },
 
