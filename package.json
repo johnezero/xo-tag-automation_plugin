@@ -1,6 +1,6 @@
 {
   "name": "xo-server-tag-automation",
-  "version": "0.9.8",
+  "version": "1.0.0",
   "description": "Automate VM performance and permissions via tags and CSV",
   "main": "dist/index.js",
   "scripts": {
@@ -18,6 +18,7 @@
   "xo-server-plugin": {
     "configurationSchema": {
       "type": "object",
+      "description": "IMPORTANT -- The 'Delete configuration' button resets all plugin settings to defaults. It does NOT delete any VMs, tags, groups, or CSV files on your NFS share.",
       "properties": {
         "schedule": {
           "type": "string",
@@ -26,16 +27,24 @@
           "enum": ["15min", "hourly", "daily"],
           "default": "hourly"
         },
+        "scheduleOffset": {
+          "type": "integer",
+          "title": "Schedule Offset (minutes)",
+          "description": "Minute offset for scheduled jobs (1-14) to prevent collisions with tasks starting on the hour or quarter-hour.",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 14
+        },
         "dryRun": {
           "type": "boolean",
           "title": "Dry Run Mode",
-          "description": "When ON (default), previews all changes in logs without applying anything.",
+          "description": "When ON (default), previews all changes in logs without applying anything. Flip OFF only after verifying dry-run output.",
           "default": true
         },
         "enablePerformance": {
           "type": "boolean",
           "title": "Enable Performance Sync",
-          "description": "Apply CPU weights and IO priorities based on VM performance tier tags (0-core, 1-high, 2-normal, 3-low).",
+          "description": "Apply CPU weights and IO priorities based on VM performance tier tags (0-core, 1-high, 2-normal, 3-low). Checks cache before writes.",
           "default": false
         },
         "enablePermissions": {
@@ -53,7 +62,7 @@
         "nfsSharePath": {
           "type": "string",
           "title": "NFS Share Path",
-          "description": "Absolute path to the NFS share directory (e.g. /mnt/v0/code/tag-automation).",
+          "description": "Absolute path to the NFS share directory containing CSV files and logs (e.g. /mnt/v0/code/tag-automation).",
           "default": "/mnt/v0/code/tag-automation"
         },
         "stalenessWarnDays": {
@@ -65,15 +74,16 @@
         "performanceTiers": {
           "type": "object",
           "title": "Performance Tier Settings",
+          "description": "CPU weight and IO priority values for each performance tier.",
           "properties": {
-            "coreWeight":   { "type": "integer", "title": "Core CPU Weight",   "default": 2048 },
-            "coreIoPri":    { "type": "integer", "title": "Core IO Priority",  "default": 7 },
-            "highWeight":   { "type": "integer", "title": "High CPU Weight",   "default": 1024 },
-            "highIoPri":    { "type": "integer", "title": "High IO Priority",  "default": 7 },
-            "normalWeight": { "type": "integer", "title": "Normal CPU Weight", "default": 512 },
-            "normalIoPri":  { "type": "integer", "title": "Normal IO Priority","default": 5 },
-            "lowWeight":    { "type": "integer", "title": "Low CPU Weight",    "default": 256 },
-            "lowIoPri":     { "type": "integer", "title": "Low IO Priority",   "default": 2 }
+            "coreWeight":   { "type": "integer", "title": "Core CPU Weight",    "default": 2048 },
+            "coreIoPri":    { "type": "integer", "title": "Core IO Priority",   "default": 7    },
+            "highWeight":   { "type": "integer", "title": "High CPU Weight",    "default": 1024 },
+            "highIoPri":    { "type": "integer", "title": "High IO Priority",   "default": 7    },
+            "normalWeight": { "type": "integer", "title": "Normal CPU Weight",  "default": 512  },
+            "normalIoPri":  { "type": "integer", "title": "Normal IO Priority", "default": 5    },
+            "lowWeight":    { "type": "integer", "title": "Low CPU Weight",     "default": 256  },
+            "lowIoPri":     { "type": "integer", "title": "Low IO Priority",    "default": 2    }
           }
         }
       }
