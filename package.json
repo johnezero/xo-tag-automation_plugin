@@ -1,6 +1,6 @@
 {
   "name": "xo-server-tag-automation",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Automate VM performance and permissions via tags and CSV",
   "main": "dist/index.js",
   "scripts": {
@@ -30,7 +30,7 @@
         "scheduleOffset": {
           "type": "integer",
           "title": "Schedule Offset (minutes)",
-          "description": "Minute offset for scheduled jobs (1-14) to prevent collisions with tasks starting on the hour or quarter-hour.",
+          "description": "Minute offset for scheduled jobs (1-14) to avoid colliding with tasks starting on the hour or quarter-hour.",
           "default": 5,
           "minimum": 1,
           "maximum": 14
@@ -44,7 +44,7 @@
         "enablePerformance": {
           "type": "boolean",
           "title": "Enable Performance Sync",
-          "description": "Apply CPU weights and IO priorities based on VM performance tier tags (0-core, 1-high, 2-normal, 3-low). Checks cache before writes.",
+          "description": "Apply CPU weights and IO priorities based on VM performance tier tags (0-core, 1-high, 2-normal, 3-low). Uses cache inspection before XAPI calls.",
           "default": false
         },
         "enablePermissions": {

@@ -1,5 +1,5 @@
 // ============================================================
-// xo-server-tag-automation v1.0.0
+// xo-server-tag-automation v1.0.1
 // Tag-Based VM Performance & Permission Management
 // for Xen Orchestra (xo-server plugin)
 // ============================================================
@@ -18,7 +18,7 @@ const pipelineAsync = promisify(pipeline);
 // CONSTANTS & DEFAULTS
 // ============================================================
 
-const PLUGIN_VERSION = "1.0.0";
+const PLUGIN_VERSION = "1.0.1";
 const FILE_CURRENT_VMS = "current-vms.csv";
 const FILE_PRELOAD_VMS = "preload-vms.csv";
 const FILE_LOG = "xo-tag-automation.log";
@@ -28,7 +28,6 @@ const ROLE_SUFFIXES = ["-Admin", "-Operator", "-Viewer"];
 
 const LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB rotation threshold
 const LOG_MAX_FILES = 3;                 // keep .log.1.gz, .log.2.gz, .log.3.gz
-const MAX_PRELOAD_RETRIES = 3;
 
 const DEFAULTS = {
   schedule: "hourly",
@@ -246,7 +245,7 @@ function getSafeXapi(xo, vm) {
 }
 
 // ============================================================
-// ASYNC BUFFERED LOGGER (Eliminates synchronous event-loop stalls)
+// ASYNC BUFFERED LOGGER
 // ============================================================
 
 class AsyncLogger {
@@ -313,7 +312,6 @@ class AsyncLogger {
   }
 }
 
-// Standalone log helper for background tasks
 async function appendLogDirectAsync(config, filename, message) {
   try {
     const logPath = getLogPath(config, filename);
@@ -338,7 +336,7 @@ async function readLogTailAsync(config, filename, lines = 50) {
 }
 
 // ============================================================
-// LOG ROTATION (Async, handles all log files)
+// LOG ROTATION (Async)
 // ============================================================
 
 async function rotateSingleLogFile(config, filename, logger = null) {
@@ -438,7 +436,6 @@ async function migrateVmMetadataCsv(config, logger) {
     try {
       await fsp.access(newPath);
     } catch (e) {
-      // newPath does not exist, safe to rename
       await fsp.rename(oldPath, newPath);
       logger.info(`Migrated legacy vm_metadata.csv -> ${FILE_CURRENT_VMS}`);
     }
@@ -573,7 +570,7 @@ async function enforcePerformance(xo, config, vmIndex, logger) {
 }
 
 // ============================================================
-// PERMISSION & ACL ENFORCEMENT (Cached Groups & Positional Args)
+// PERMISSION & ACL ENFORCEMENT
 // ============================================================
 
 function isPermissionTag(tag) {
@@ -788,27 +785,14 @@ async function processPreloadVms(xo, config, vmIndex, groupMap, logger) {
     const vmName = (cols[0] || "").trim();
     const tagsRaw = (cols[1] || "").trim();
     const notesRaw = (cols[2] || "").trim();
-    const retryMeta = cols[3] || "";
 
     if (!vmName) continue;
-
-    let retryCount = 0;
-    const retryMatch = retryMeta.match(/retry=(\d+)/);
-    if (retryMatch) {
-      retryCount = parseInt(retryMatch[1], 10);
-    }
 
     const vm = vmIndex.byNameLower.get(vmName.toLowerCase());
 
     if (!vm) {
-      retryCount++;
-      if (retryCount >= MAX_PRELOAD_RETRIES) {
-        logger.warn(`[Preload] VM "${vmName}" not found after ${MAX_PRELOAD_RETRIES} attempts -- archiving row`);
-        remainingRows.push(`# [NOT FOUND EXPIRED] ${line}`);
-      } else {
-        logger.info(`[Preload] VM "${vmName}" not found (attempt ${retryCount}/${MAX_PRELOAD_RETRIES}) -- retrying next cycle`);
-        remainingRows.push(`${cols[0]},${cols[1] || ""},${cols[2] || ""},retry=${retryCount}`);
-      }
+      // VM not yet migrated/created in XO -- keep in queue indefinitely
+      remainingRows.push(line);
       notFound++;
       continue;
     }
